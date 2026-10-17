@@ -101,6 +101,7 @@ source = { editable = "." }
 dependencies = [
     { name = "fonttools" },
     { name = "opentype-feature-freezer" },
+    { name = "pyinstaller" },
     { name = "pyside6" },
 ]
 
@@ -114,6 +115,7 @@ dev = [
 requires-dist = [
     { name = "fonttools", specifier = ">=4.66.1" },
     { name = "opentype-feature-freezer", specifier = ">=1.32.2" },
+    { name = "pyinstaller", specifier = ">=6.22.3" },
     { name = "pyside6", specifier = ">=6.12.0" },
 ]
 

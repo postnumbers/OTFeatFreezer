@@ -175,9 +175,9 @@ FEATURE_NAMES = {
 THEMES = {
     # bg: the window; field: text fields and checkboxes; neutral: main button
     "light": dict(bg="#ecece8", field="#ffffff", neutral="#d6d6d0", fg="#1d1d1f", muted="#66666b", border="#c2c2bc",
-                  accent="#2563c9", on_accent="#ffffff", pressed="#e3e3de"),
+                  accent="#6b6b70", on_accent="#ffffff", changed="#2f6bc4", pressed="#e3e3de"),
     "dark": dict(bg="#1f2023", field="#303137", neutral="#45464d", fg="#e8e8ea", muted="#9d9da3", border="#505157",
-                 accent="#5b9cf6", on_accent="#101114", pressed="#2d2e33"),
+                 accent="#a3a3a9", on_accent="#1f2023", changed="#85b4f2", pressed="#2d2e33"),
 }
 
 STYLE_SHEET = """
@@ -470,9 +470,13 @@ def main_characters(codepoints, ligatures: dict | None = None,
     """A sample string of the font's main encoded characters, one group per line.
 
     Order: A-Z, a-z, 0-9, punctuation, then sequences that may form standard
-    or coding ligatures, then accented and other Latin letters, remaining
-    symbols, and finally other scripts.
+    or coding ligatures, then other Latin letters, remaining symbols, other
+    scripts, and finally all letters with diacritics.
     """
+    def has_diacritic(char: str) -> bool:
+        return any(unicodedata.category(c) == "Mn"
+                   for c in unicodedata.normalize("NFD", char)[1:])
+
     entries = []
     for codepoint in codepoints:
         char = chr(codepoint)
@@ -483,6 +487,8 @@ def main_characters(codepoints, ligatures: dict | None = None,
         case = {"Lu": 0, "Ll": 1}.get(category, 2)
         if char.isascii() and char.isalpha():
             group = (0, "", case)
+        elif category[0] == "L" and has_diacritic(char):
+            group = (6, "", case)  # accented letters of any script come last
         elif char.isascii() and char.isdigit():
             group = (1, "", 0)
         elif char.isascii() or (category[0] == "P" and (
@@ -501,7 +507,10 @@ def main_characters(codepoints, ligatures: dict | None = None,
     for _, script, _, codepoint in sorted(entries, key=lambda e: e[3]):
         first_seen.setdefault(script, codepoint)
     entries.sort(key=lambda e: (e[0], first_seen[e[1]], e[2], e[3]))
-    entries = entries[:limit]
+    # Accented letters come last but get their own allowance, so a large
+    # font's other characters cannot crowd them out of the sample.
+    accented = [e for e in entries if e[0] == 6][:limit // 2]
+    entries = [e for e in entries if e[0] != 6][:limit] + accented
 
     lines: list[tuple[tuple, str]] = []
     for rank, script, kind, codepoint in entries:
@@ -1085,6 +1094,8 @@ class MainWindow(QMainWindow):
         self._selected_tags: set[str] = set()  # ticked features, kept across fonts
         self._disabled: dict[str, set[str]] = {}  # tag -> excluded source glyphs
         self._previewing_tag: str | None = None   # feature whose dialog is open
+        self._last_font_folder = ""                # where "Add fonts…" last looked
+        self._status_text = ("", "")               # preview status: before / after count
         self._auto_preview_text = ""           # last preview text the app filled in
         self._feature_boxes: list[QCheckBox] = []
         self._changed: set[int] = set()
@@ -1103,8 +1114,13 @@ class MainWindow(QMainWindow):
         self._settings = QSettings("featfreeze_gui", "featfreeze_gui")
         app = QApplication.instance()
         app.setStyle("Fusion")  # the one style that follows a custom palette everywhere
-        theme = self._settings.value("theme", "")
-        self._theme = theme if theme in THEMES else system_theme(app)
+        # Start in the system's appearance every time, and follow it when it
+        # changes; the theme button overrides it until the system changes again.
+        self._theme = system_theme(app)
+        try:
+            app.styleHints().colorSchemeChanged.connect(self._system_theme_changed)
+        except AttributeError:  # Qt older than 6.5
+            pass
 
         central = QWidget()
         layout = QVBoxLayout(central)
@@ -1370,6 +1386,7 @@ class MainWindow(QMainWindow):
         self.preview_edit.setAcceptRichText(False)
         self.preview_edit.setPlaceholderText(
             "Add a font to see a preview. You can also type your own text here.")
+        self.preview_edit.textChanged.connect(self._refresh_changed_highlight)
         box.addWidget(self.preview_edit, 1)
         self.preview_status = _label("", "hint")
         box.addWidget(self.preview_status)
@@ -1401,6 +1418,8 @@ class MainWindow(QMainWindow):
         apply_theme(QApplication.instance(), name)
         # A new style sheet resets widget fonts, so set them again.
         self._apply_preview_font()
+        if hasattr(self, "_status_text"):
+            self._refresh_changed_highlight()  # blue for this theme
         self.log_edit.setFont(
             QFontDatabase.systemFont(QFontDatabase.SystemFont.FixedFont))
         # The icon shows the mode the button switches to.
@@ -1412,7 +1431,11 @@ class MainWindow(QMainWindow):
             button.setIcon(help_icon)
         self.theme_button.setToolTip(f"Switch to {other} mode")
         self.theme_button.setAccessibleName(f"Switch to {other} mode")
-        self._settings.setValue("theme", name)
+
+    def _system_theme_changed(self, *_args) -> None:
+        theme = system_theme(QApplication.instance())
+        if theme != self._theme:
+            self._set_theme(theme)
 
     def _toggle_theme(self) -> None:
         self._set_theme("light" if self._theme == "dark" else "dark")
@@ -1554,10 +1577,14 @@ class MainWindow(QMainWindow):
             event.ignore()
 
     def _add_fonts(self) -> None:
-        start = os.path.dirname(self._active_font) if self._active_font else ""
+        # First time: the user's Fonts folder; afterwards the last folder used.
+        start = self._last_font_folder or os.path.expanduser("~/Library/Fonts")
+        if not os.path.isdir(start):
+            start = os.path.expanduser("~")
         paths, _ = QFileDialog.getOpenFileNames(
             self, "Select font files", start, FONT_FILTER)
         if paths:
+            self._last_font_folder = os.path.dirname(paths[0])
             self.add_font_paths(paths)
 
     def _remove_fonts(self) -> None:
@@ -1852,12 +1879,13 @@ class MainWindow(QMainWindow):
                 self._preview_font_id = font_id
                 self._preview_family = families[0]
                 shown = ", ".join(features) if features else "no features"
-                status = (f"{os.path.basename(self._active_font)} with {shown}: "
-                          f"{len(self._changed)} character(s) changed.{note}")
+                status = (f"{os.path.basename(self._active_font)} with "
+                          f"{shown}{note}: ", "")
             except Exception as exc:
-                status = f"Preview unavailable: {type(exc).__name__}: {exc}"
+                status = (f"Preview unavailable: {type(exc).__name__}: {exc}", None)
+        self._status_text = status if isinstance(status, tuple) else ("", None)
         self._apply_preview_font()
-        self.preview_status.setText(status)
+        self._refresh_changed_highlight()
         self._names_timer.start()  # features or the selected font changed
         self.changed_button.setEnabled(bool(self._changed))
         if old_id >= 0:
@@ -1877,6 +1905,46 @@ class MainWindow(QMainWindow):
             font = QFont(self.font())
             font.setPointSize(size)
         self.preview_edit.setFont(font)
+
+    def _refresh_changed_highlight(self) -> None:
+        """Colour the preview characters the selected features change, and
+        count them in the status line."""
+        text = self.preview_edit.toPlainText()
+        color = QColor(THEMES[self._theme]["changed"])
+        # Collect runs of adjacent changed characters and colour each run as
+        # one range: Qt drops every other one of many back-to-back ranges.
+        runs: list[list[int]] = []  # [start, end) in UTF-16 code units
+        present: set[int] = set()
+        position = 0  # QTextDocument positions count UTF-16 code units
+        for char in text:
+            size = 2 if ord(char) > 0xFFFF else 1
+            if ord(char) in self._changed:
+                present.add(ord(char))
+                if runs and runs[-1][1] == position:
+                    runs[-1][1] += size
+                else:
+                    runs.append([position, position + size])
+            position += size
+        selections = []
+        for start, end in runs:
+            selection = QTextEdit.ExtraSelection()
+            cursor = QTextCursor(self.preview_edit.document())
+            cursor.setPosition(start)
+            cursor.setPosition(end, QTextCursor.MoveMode.KeepAnchor)
+            selection.cursor = cursor
+            selection.format.setForeground(color)
+            selections.append(selection)
+        self.preview_edit.setExtraSelections(selections)
+
+        prefix, note = self._status_text
+        if note is None:  # an error message
+            self.preview_status.setText(prefix)
+        elif prefix:
+            self.preview_status.setText(
+                f"{prefix}{len(present)} character(s) changed (shown in blue) "
+                "in the sample text above.")
+        else:
+            self.preview_status.setText("")
 
     def _fill_preview(self, text: str) -> None:
         self._auto_preview_text = text
@@ -2021,7 +2089,7 @@ def shut_down(window: MainWindow) -> None:
     """
     import shiboken6
 
-    window._settings.sync()       # save the theme choice before exiting
+    window._settings.sync()       # flush any saved settings before exiting
     HelpButton.instances.clear()
     if shiboken6.isValid(window):
         shiboken6.delete(window)
