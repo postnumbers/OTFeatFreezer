@@ -560,9 +560,29 @@ def unique_path(folder: str, filename: str, taken: set[str]) -> str:
     return target
 
 
-def output_filename(font: TTFont, inpath: str, renamed: bool) -> str:
+def replace_in_filename(stem: str, replacenames: str) -> str:
+    """Apply the replace names pairs to a file name (without extension).
+
+    Each pair is applied as typed and with its spaces removed, because file
+    names follow PostScript names, which have no spaces. Case-sensitive.
+    """
+    for pair in replacenames.split(",") if replacenames else ():
+        if pair.count("/") != 1:
+            continue
+        search, replace = pair.split("/")
+        if search:
+            stem = stem.replace(search, replace)
+            compact = search.replace(" ", "")
+            if compact and compact != search:
+                stem = stem.replace(compact, replace.replace(" ", ""))
+    return re.sub(r'[\\/:*?"<>|\x00-\x1f]', "", stem).strip()
+
+
+def output_filename(font: TTFont, inpath: str, renamed: bool,
+                    replacenames: str = "") -> str:
     """Name the output after the font's new PostScript name, e.g.
-    'Inter-Bold.otf' -> 'InterFrozen-Bold.otf'. Unrenamed fonts keep their name."""
+    'Inter-Bold.otf' -> 'InterFrozen-Bold.otf', with the replace names pairs
+    also applied to the file name. Unrenamed fonts keep their name."""
     source = Path(inpath)
     stem = source.stem
     if renamed:
@@ -570,6 +590,7 @@ def output_filename(font: TTFont, inpath: str, renamed: bool) -> str:
         postscript_name = re.sub(r'[\\/:*?"<>|\x00-\x1f]', "", postscript_name).strip()
         if postscript_name:
             stem = postscript_name
+    stem = replace_in_filename(stem, replacenames) or source.stem
     return f"{stem}{source.suffix}"
 
 
@@ -638,8 +659,20 @@ def remap_glyphs(remapper: RemapByOTL, disabled: dict | None = None) -> None:
         print(" ".join(names))
 
 
+def output_target(folder: str, filename: str, inpath: str, taken: set[str],
+                  overwrite: bool) -> str:
+    """Where a font is saved. `taken` holds the input fonts and the outputs
+    so far. With `overwrite`, a font may replace its own input file (but never
+    another input or an earlier output); otherwise "-featfreeze" is added."""
+    own = os.path.realpath(inpath)
+    blocked = (taken - {own}) if overwrite else set(taken)
+    target = unique_path(folder, filename, blocked)
+    taken.add(os.path.realpath(target))
+    return target
+
+
 def freeze_font(options: SimpleNamespace, folder: str, taken: set[str],
-                disabled: dict | None = None) -> str | None:
+                disabled: dict | None = None, overwrite: bool = False) -> str | None:
     """Freeze one font into `folder`. Returns the saved path, or None on failure."""
     remapper = RemapByOTL(options)
     remapper.openFont()
@@ -647,14 +680,45 @@ def freeze_font(options: SimpleNamespace, folder: str, taken: set[str],
         return None
     try:
         remap_glyphs(remapper, disabled)
+        names = remapper.ttx["name"]
+        old_family = names.getDebugName(16) or names.getDebugName(1) or ""
+        old_postscript = names.getDebugName(6) or ""
         remapper.renameFont()
         renamed = bool(options.suffix or options.replacenames)
-        filename = output_filename(remapper.ttx, options.inpath, renamed)
-        remapper.outpath = unique_path(folder, filename, taken)
+        if renamed:
+            # The library leaves the unique ID (name ID 3) on the old names;
+            # bring it in line with the new family and PostScript names.
+            new_family = names.getDebugName(16) or names.getDebugName(1) or ""
+            new_postscript = names.getDebugName(6) or ""
+            for record in names.names:
+                if record.nameID != 3:
+                    continue
+                text = record.toStr()
+                if old_postscript and new_postscript:
+                    text = text.replace(old_postscript, new_postscript)
+                if old_family and new_family:
+                    text = text.replace(old_family, new_family)
+                    text = text.replace(old_family.replace(" ", ""),
+                                        new_family.replace(" ", ""))
+                record.string = text
+        filename = output_filename(remapper.ttx, options.inpath, renamed,
+                                   options.replacenames)
+        target = output_target(folder, filename, options.inpath, taken, overwrite)
+        replacing = os.path.realpath(target) == os.path.realpath(options.inpath)
+        # The input is still being read, so never write over it directly:
+        # save next to it and swap the files once it is closed.
+        remapper.outpath = target + ".featfreeze-tmp" if replacing else target
         remapper.saveFont()
-        return remapper.outpath if remapper.success else None
+        saved = remapper.success
     finally:
         remapper.closeFont()
+    if not saved:
+        if os.path.exists(remapper.outpath) and remapper.outpath != target:
+            os.remove(remapper.outpath)
+        return None
+    if remapper.outpath != target:
+        os.replace(remapper.outpath, target)
+    return target
 
 
 def predict_names(path: str, suffix: str, replacenames: str) -> dict:
@@ -687,6 +751,7 @@ def predict_names(path: str, suffix: str, replacenames: str) -> dict:
         postscript = postscript.replace(old_family.replace(" ", ""),
                                         new_family.replace(" ", ""))
         stem = re.sub(r'[\\/:*?"<>|\x00-\x1f]', "", postscript).strip()
+        stem = replace_in_filename(stem or Path(path).stem, replacenames)
         return {"filename": f"{stem or Path(path).stem}{Path(path).suffix}",
                 "family": new_family, "full": full, "postscript": postscript}
     finally:
@@ -773,8 +838,10 @@ class FreezeWorker(QThread):
     progress = Signal(int)
     completed = Signal(int, int)  # saved, failed
 
-    def __init__(self, paths: list[str], folder: str, settings: dict, parent=None):
+    def __init__(self, paths: list[str], folder: str, settings: dict,
+                 overwrite: bool = False, parent=None):
         super().__init__(parent)
+        self._overwrite = overwrite
         self._paths = paths
         self._folder = folder
         self._settings = settings
@@ -786,7 +853,8 @@ class FreezeWorker(QThread):
         FREEZER_LOGGER.addHandler(handler)
         FREEZER_LOGGER.setLevel(
             logging.INFO if settings["verbose"] else logging.WARNING)
-        # Outputs never overwrite an input font or each other.
+        # Outputs never overwrite another input font or each other; a font
+        # replaces its own file only when the user chose to overwrite.
         taken = {os.path.realpath(path) for path in self._paths}
         saved = failed = 0
         try:
@@ -805,7 +873,7 @@ class FreezeWorker(QThread):
                                 "suffix", "usesuffix", "replacenames",
                                 "info", "names", "verbose")})
                         outpath = freeze_font(options, self._folder, taken,
-                                              settings["disabled"])
+                                              settings["disabled"], self._overwrite)
                     except Exception as exc:  # keep going with the other fonts
                         print(f"ERROR: {type(exc).__name__}: {exc}")
                     if outpath:
@@ -1116,7 +1184,11 @@ class MainWindow(QMainWindow):
         app.setStyle("Fusion")  # the one style that follows a custom palette everywhere
         # Start in the system's appearance every time, and follow it when it
         # changes; the theme button overrides it until the system changes again.
-        self._theme = system_theme(app)
+        # Follow the system unless the theme button has set an override,
+        # which is remembered across launches.
+        override = self._settings.value("theme_override", "")
+        self._theme_override = override if override in THEMES else ""
+        self._theme = self._theme_override or system_theme(app)
         try:
             app.styleHints().colorSchemeChanged.connect(self._system_theme_changed)
         except AttributeError:  # Qt older than 6.5
@@ -1304,22 +1376,6 @@ class MainWindow(QMainWindow):
             grid.setRowMinimumHeight(row + 1, 6)
             return check
 
-        add_heading(GROUP_FREEZING)
-        self.script_combo = QComboBox()
-        self.script_combo.setEditable(True)
-        self.script_combo.currentTextChanged.connect(self._script_changed)
-        add_field("script", self.script_combo, "script")
-        self.lang_combo = QComboBox()
-        self.lang_combo.setEditable(True)
-        self.lang_combo.currentTextChanged.connect(self._schedule_preview)
-        add_field("language", self.lang_combo, "lang")
-        self.zapnames_check = add_check("zapnames")
-
-        add_heading(GROUP_REPORTING)
-        self.report_check = add_check("report")
-        self.names_check = add_check("names")
-        self.verbose_check = add_check("verbose")
-
         add_heading(GROUP_RENAMING)
         self.suffix_check = add_check("suffix")
         self.suffix_edit = QLineEdit()
@@ -1354,6 +1410,22 @@ class MainWindow(QMainWindow):
         grid.setRowMinimumHeight(grid.rowCount(), 6)
         grid.addLayout(names, grid.rowCount(), 0, 1, 2)
 
+        add_heading(GROUP_FREEZING)
+        self.script_combo = QComboBox()
+        self.script_combo.setEditable(True)
+        self.script_combo.currentTextChanged.connect(self._script_changed)
+        add_field("script", self.script_combo, "script")
+        self.lang_combo = QComboBox()
+        self.lang_combo.setEditable(True)
+        self.lang_combo.currentTextChanged.connect(self._schedule_preview)
+        add_field("language", self.lang_combo, "lang")
+        self.zapnames_check = add_check("zapnames")
+
+        add_heading(GROUP_REPORTING)
+        self.report_check = add_check("report")
+        self.names_check = add_check("names")
+        self.verbose_check = add_check("verbose")
+
         column.addLayout(grid)
         column.addStretch(1)
         return panel
@@ -1364,20 +1436,18 @@ class MainWindow(QMainWindow):
 
         section, box, _ = _section("Preview")
         row = QHBoxLayout()
-        main_button = QPushButton("Main characters")
-        main_button.setToolTip("Show the main characters of the first input font.")
-        main_button.clicked.connect(self._show_main_characters)
-        self.changed_button = QPushButton("Changed characters only")
-        self.changed_button.setToolTip(
-            "Show only the characters that the selected features change.")
-        self.changed_button.clicked.connect(self._show_changed_characters)
+        self._hide_unchanged = False
+        self.unchanged_button = QPushButton("Hide unchanged characters")
+        self.unchanged_button.setToolTip(
+            "Switch between the main characters of the selected font and only "
+            "the characters the selected features change.")
+        self.unchanged_button.clicked.connect(self._toggle_unchanged)
         self.size_spin = QSpinBox()
         self.size_spin.setRange(8, 200)
         self.size_spin.setValue(32)
         self.size_spin.setSuffix(" pt")
         self.size_spin.valueChanged.connect(self._apply_preview_font)
-        row.addWidget(main_button)
-        row.addWidget(self.changed_button)
+        row.addWidget(self.unchanged_button)
         row.addStretch(1)
         row.addWidget(QLabel("Size"))
         row.addWidget(self.size_spin)
@@ -1390,9 +1460,11 @@ class MainWindow(QMainWindow):
         box.addWidget(self.preview_edit, 1)
         self.preview_status = _label("", "hint")
         box.addWidget(self.preview_status)
+        box.addWidget(_label("Note that some changed characters may not be "
+                             "present in the above sample text.", "hint"))
         splitter.addWidget(section)
 
-        section, box, _ = _section("Processing output")
+        section, box, _ = _section("Processing output (showing progress)")
         self.log_edit = QPlainTextEdit()
         self.log_edit.setReadOnly(True)
         box.addWidget(self.log_edit, 1)
@@ -1433,12 +1505,23 @@ class MainWindow(QMainWindow):
         self.theme_button.setAccessibleName(f"Switch to {other} mode")
 
     def _system_theme_changed(self, *_args) -> None:
+        if self._theme_override:
+            return  # the button's choice wins until it is clicked back
         theme = system_theme(QApplication.instance())
         if theme != self._theme:
             self._set_theme(theme)
 
     def _toggle_theme(self) -> None:
-        self._set_theme("light" if self._theme == "dark" else "dark")
+        theme = "light" if self._theme == "dark" else "dark"
+        # Clicking back to the system's appearance resumes following it.
+        if theme == system_theme(QApplication.instance()):
+            self._theme_override = ""
+            self._settings.remove("theme_override")
+        else:
+            self._theme_override = theme
+            self._settings.setValue("theme_override", theme)
+        self._settings.sync()
+        self._set_theme(theme)
 
     # ---- input fonts ----------------------------------------------------- #
 
@@ -1639,7 +1722,8 @@ class MainWindow(QMainWindow):
         self._rebuild_features()
         self._rebuild_tags()
         # Keep text the user typed; only replace text the app filled in itself.
-        if self.preview_edit.toPlainText() in ("", self._auto_preview_text):
+        if (self.preview_edit.toPlainText() in ("", self._auto_preview_text)
+                and not self._hide_unchanged):
             self._show_main_characters()
         self._update_preview()
 
@@ -1660,6 +1744,62 @@ class MainWindow(QMainWindow):
         suffix = self.suffix_edit.text().strip() if self.suffix_check.isChecked() else ""
         return suffix, replacenames
 
+    def _planned_outputs(self, overwrite: bool) -> list[tuple[str, str | None]]:
+        """(input path, output file name) for every font, as Generate would
+        name them with or without overwriting each font's own file."""
+        settings = self._rename_settings()
+        folder = self.output_edit.text().strip()
+        folder = os.path.abspath(os.path.expanduser(folder)) if folder else ""
+        paths = self.font_paths()
+        taken = {os.path.realpath(path) for path in paths}
+        plan = []
+        for path in paths:
+            try:
+                filename = predict_names(path, *settings)["filename"] if settings else None
+            except Exception:
+                filename = None
+            if filename and folder:
+                filename = os.path.basename(
+                    output_target(folder, filename, path, taken, overwrite))
+            plan.append((path, filename))
+        return plan
+
+    def _ask_overwrite(self, clashes: list[str]) -> str | None:
+        """Ask whether to overwrite input fonts or add a suffix, then confirm.
+        Returns "overwrite", "suffix" or None (cancelled)."""
+        listed = "\n".join(os.path.basename(path) for path in clashes[:10])
+        if len(clashes) > 10:
+            listed += f"\n… and {len(clashes) - 10} more"
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Icon.Warning)
+        box.setWindowTitle("Output files would replace the input files")
+        box.setText(f"{len(clashes)} output file(s) have the same name and "
+                    "folder as the font they are made from:")
+        box.setInformativeText(listed + "\n\nOverwrite the original files, or "
+                               "save the new ones with \"-featfreeze\" added?")
+        overwrite = box.addButton("Overwrite originals",
+                                  QMessageBox.ButtonRole.DestructiveRole)
+        suffix = box.addButton("Add suffix", QMessageBox.ButtonRole.AcceptRole)
+        box.addButton(QMessageBox.StandardButton.Cancel)
+        box.setDefaultButton(suffix)
+        box.exec()
+        if box.clickedButton() is overwrite:
+            choice = "overwrite"
+            question = (f"Overwrite {len(clashes)} original font file(s)? The "
+                        "originals will be replaced and cannot be recovered.")
+        elif box.clickedButton() is suffix:
+            choice = "suffix"
+            question = (f"Save {len(clashes)} font file(s) with \"-featfreeze\" "
+                        "added to the name, keeping the originals?")
+        else:
+            return None
+        answer = QMessageBox.question(
+            self, "Confirm", question,
+            QMessageBox.StandardButton.Ok | QMessageBox.StandardButton.Cancel,
+            QMessageBox.StandardButton.Cancel if choice == "overwrite"
+            else QMessageBox.StandardButton.Ok)
+        return choice if answer == QMessageBox.StandardButton.Ok else None
+
     def _update_output_names(self) -> None:
         """Fill in each font's output file name and the selected font's
         PostScript name, exactly as Generate will name them."""
@@ -1667,7 +1807,7 @@ class MainWindow(QMainWindow):
         folder = self.output_edit.text().strip()
         folder = os.path.abspath(os.path.expanduser(folder)) if folder else ""
         paths = self.font_paths()
-        taken = {os.path.realpath(path) for path in paths}
+        planned = dict(self._planned_outputs(overwrite=True))
         names_of = {}
         for row, path in enumerate(paths):
             item = self.font_list.item(row)
@@ -1676,9 +1816,9 @@ class MainWindow(QMainWindow):
                 continue
             try:
                 names = predict_names(path, *settings)
-                filename = names["filename"]
-                if folder:  # as when saving: never overwrite an input or another output
-                    filename = os.path.basename(unique_path(folder, filename, taken))
+                # Shown as proposed; a clash with the font's own file is
+                # resolved only when Generate is clicked.
+                filename = planned.get(path) or names["filename"]
             except Exception as exc:
                 names, filename = {}, f"cannot tell: {type(exc).__name__}"
             names_of[path] = names
@@ -1734,6 +1874,7 @@ class MainWindow(QMainWindow):
             box.setProperty("tag", tag)
             box.setChecked(tag in checked)
             box.setToolTip(tip)
+            box.setEnabled(bool(pairs))  # greyed out when it cannot be frozen
             box.toggled.connect(self._feature_toggled)
             row = QWidget()
             row_layout = QHBoxLayout(row)
@@ -1887,7 +2028,8 @@ class MainWindow(QMainWindow):
         self._apply_preview_font()
         self._refresh_changed_highlight()
         self._names_timer.start()  # features or the selected font changed
-        self.changed_button.setEnabled(bool(self._changed))
+        if self._hide_unchanged:
+            self._show_changed_characters()  # keep the list current
         if old_id >= 0:
             QFontDatabase.removeApplicationFont(old_id)
 
@@ -1951,11 +2093,27 @@ class MainWindow(QMainWindow):
         self.preview_edit.setPlainText(text)
 
     def _show_main_characters(self) -> None:
+        self.preview_edit.setPlaceholderText(
+            "Add a font to see a preview. You can also type your own text here.")
         self._fill_preview(main_characters(
             self._font_info["cmap"], self._font_info["ligatures"]))
 
     def _show_changed_characters(self) -> None:
-        self._fill_preview(main_characters(self._changed))
+        self.preview_edit.setPlaceholderText(
+            "No characters change with the current selection.")
+        text = main_characters(self._changed)
+        if text != self.preview_edit.toPlainText():
+            self._fill_preview(text)
+
+    def _toggle_unchanged(self) -> None:
+        self._hide_unchanged = not self._hide_unchanged
+        self.unchanged_button.setText("Show unchanged characters"
+                                      if self._hide_unchanged
+                                      else "Hide unchanged characters")
+        if self._hide_unchanged:
+            self._show_changed_characters()
+        else:
+            self._show_main_characters()
 
     # ---- processing ------------------------------------------------------ #
 
@@ -2020,7 +2178,24 @@ class MainWindow(QMainWindow):
                 + "\n\nUntick those features or remove those fonts.")
             return
 
+        clashes = [path for path, name in self._planned_outputs(overwrite=True)
+                   if name and os.path.realpath(os.path.join(folder, name))
+                   == os.path.realpath(path)]
+        overwrite = False
+        if clashes:
+            choice = self._ask_overwrite(clashes)
+            if choice is None:
+                return
+            overwrite = choice == "overwrite"
+            if not overwrite:  # show the names the files will really get
+                for row, (_, name) in enumerate(self._planned_outputs(overwrite=False)):
+                    if name:
+                        self.font_list.item(row).setText(1, name)
+
         self.log_edit.clear()
+        if overwrite:
+            self._log("Overwriting the original font files: "
+                      + ", ".join(os.path.basename(path) for path in clashes))
         if not settings["features"]:
             self._log("Note: no features are selected, so no glyphs will be remapped.")
         excluded = {tag: glyphs for tag, glyphs in settings["disabled"].items()
@@ -2039,7 +2214,7 @@ class MainWindow(QMainWindow):
         self.progress_bar.setValue(0)
         self.progress_bar.setVisible(True)
 
-        self._worker = FreezeWorker(paths, folder, settings, self)
+        self._worker = FreezeWorker(paths, folder, settings, overwrite, self)
         self._worker.message.connect(self._log)
         self._worker.progress.connect(self.progress_bar.setValue)
         self._worker.completed.connect(self._generation_done)

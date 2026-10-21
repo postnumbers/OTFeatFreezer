@@ -1,7 +1,7 @@
 [project]
 name = "otfeatfreezer"
-version = "0.1.0"
-description = "Add your description here"
+version = "0.3.0"
+description = "freezes OpenType features in fonts"
 readme = "README.md"
 authors = [
     { name = "postnumbers", email = "post@postnumbers.com" }
