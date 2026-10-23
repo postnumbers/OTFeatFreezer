@@ -13,4 +13,4 @@ wheels/
 *.spec
 
 # disk images
-dmg/
+*.dmg

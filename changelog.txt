@@ -1,0 +1,26 @@
+# Changelog
+
+All notable changes to this project are documented here.
+The format follows Keep a Changelog, and the project uses Semantic Versioning.
+
+## [0.4.0] - 2026-10-23
+### Added
+- Ability to rename font styles.
+### Changed
+- Settings window now remembers its size
+### Fixed
+- the output file name used to get the pairs was being applied twice, once in the PostScript name and again on the file name. A pair whose replacement contains its search text, like Sans/Sans Pro, would have produced “SansProPro”. Now the file name simply follows the new PostScript name.
+
+## [0.3.0] - 2026-10-22
+### Changed
+- The replace field now affects output font file names
+options related to file names were moved upwards in the GUI
+if an OpenType feature is not freezable, it will be greyed out
+now a single button controlling what is showed in the preview pane
+contents of the preview pane are now updated when changes are made to the OpenType features selected
+- The appearance mirrors system settings appearance and can be overridden via the appearance button
+- Can now save over input font files or rename them
+description below preview panel now states that not all changed characters are shown
+- Clarified description of Processing Output pane
+### Fixed
+- character highlighting bug
