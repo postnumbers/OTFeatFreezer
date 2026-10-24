@@ -98,7 +98,6 @@ HELP = {
 # Labels shown on the controls (the app's option names are kept in HELP keys).
 LABELS = {
     "zapnames": "zap glyph names",
-    "suffix": "add suffix to font family name",
     "usesuffix": "custom suffix",
     "replacenames": "replace names",
     "info": "update font version string",
@@ -114,18 +113,21 @@ POPUP = {
             "use the default language.",
     "zapnames": "Zap glyph names from the font ('post' table version 3, .ttf "
                 "only). Makes the file smaller.",
-    "suffix": "Add the custom suffix to the font family name, e.g. 'Inter' "
-              "becomes 'Inter SC'. OpenType feature tags are never added to "
-              "the family name. Output files and PostScript names follow the "
-              "new family name.",
-    "usesuffix": "The suffix added to the font family name when 'add suffix "
-                 "to font family name' is ticked, e.g. 'SC'.",
-    "replacenames": "Change the font family name by replacing text in it, "
-                    "e.g. Inter/Outer renames the Inter family to Outer. Only "
-                    "the family name is searched (not the style name), and the "
-                    "search is case-sensitive. The full name, PostScript name "
-                    "and output file name follow the new family name. Format: "
-                    "search1/replace1,search2/replace2,...",
+    "usesuffix": "Text added to the font family name, e.g. 'SC' turns "
+                 "'Inter' into 'Inter SC'. Leave empty to keep the family "
+                 "name. The full name, PostScript name and output file name "
+                 "follow the new family name. OpenType feature tags are never "
+                 "added to the family name.",
+    "replacenames": "Rename the font family and its styles by replacing "
+                    "text in their names, e.g. Inter/Outer renames the Inter "
+                    "family to Outer, and Bold/Heavy renames the Bold style to "
+                    "Heavy. Each pair is applied to both the family name and "
+                    "the style name; the search is case-sensitive. The full "
+                    "name, PostScript name and output file name follow the new "
+                    "names. The basic style name used for style linking "
+                    "(Regular, Italic, Bold, Bold Italic) is kept; the new "
+                    "style name is stored as the typographic style name. "
+                    "Format: search1/replace1,search2/replace2,...",
     "info": "Update the font version string by appending '; featfreeze: "
             "<features>'. Only takes effect together with a suffix or "
             "replace names.",
@@ -137,7 +139,9 @@ POPUP = {
                "remap, new name and saved path.",
     "inpath": "Input .otf or .ttf font files and the file name each will be "
               "saved as. Add fonts with 'Add fonts…', or drag files or folders "
-              "in from Finder. Each font must contain the features you tick. "
+              "in from Finder. Fonts may have different features: a ticked "
+              "feature is frozen in the fonts that have it, and fonts without "
+              "it are still processed. "
               "Select a font to show its features, preview and PostScript name.",
     "output": "Folder for the output .otf or .ttf font files. Each file is "
               "named after the font's new name; input fonts are never "
@@ -146,7 +150,9 @@ POPUP = {
                 "shows how many glyph substitutions it can freeze; click it to "
                 "see them and switch individual substitutions on or off for "
                 "the output fonts. Features marked 'not in all fonts' are "
-                "missing from some input fonts.",
+                "frozen only in the fonts that have them; 'not in this font' "
+                "features come from other input fonts (select one of those "
+                "fonts to preview them).",
 }
 
 FEATURE_NAMES = {
@@ -402,6 +408,14 @@ def feature_tags(path: str) -> frozenset[str]:
         font.close()
 
 
+def friendly_feature_name(tag: str) -> str:
+    if tag[:2] == "ss" and tag[2:].isdigit():
+        return f"Stylistic Set {int(tag[2:])}"
+    if tag[:2] == "cv" and tag[2:].isdigit():
+        return f"Character Variant {int(tag[2:])}"
+    return FEATURE_NAMES.get(tag, "")
+
+
 def read_font_info(path: str) -> dict:
     """Return the GSUB features, scripts/languages and character map of a font.
 
@@ -560,37 +574,147 @@ def unique_path(folder: str, filename: str, taken: set[str]) -> str:
     return target
 
 
+def parse_pairs(replacenames: str) -> list[tuple[str, str]]:
+    """'Inter/Outer,Bold/Heavy' -> [('Inter', 'Outer'), ('Bold', 'Heavy')].
+    Pairs without exactly one '/' or with nothing to search for are skipped."""
+    pairs = []
+    for pair in replacenames.split(",") if replacenames else ():
+        if pair.count("/") == 1:
+            search, replace = pair.split("/")
+            if search:
+                pairs.append((search, replace))
+    return pairs
+
+
+def apply_pairs(text: str, pairs: list[tuple[str, str]], compact: bool = False) -> str:
+    """Apply the replace names pairs to `text`, in order. Case-sensitive.
+
+    With `compact`, each pair is also applied with its spaces removed, for
+    PostScript and file names, which have no spaces ('Semi Bold/Demi' also
+    turns 'SemiBold' into 'Demi')."""
+    for search, replace in pairs:
+        text = text.replace(search, replace)
+        if compact:
+            short = search.replace(" ", "")
+            if short and short != search:
+                text = text.replace(short, replace.replace(" ", ""))
+    return text
+
+
 def replace_in_filename(stem: str, replacenames: str) -> str:
     """Apply the replace names pairs to a file name (without extension).
 
     Each pair is applied as typed and with its spaces removed, because file
     names follow PostScript names, which have no spaces. Case-sensitive.
     """
-    for pair in replacenames.split(",") if replacenames else ():
-        if pair.count("/") != 1:
-            continue
-        search, replace = pair.split("/")
-        if search:
-            stem = stem.replace(search, replace)
-            compact = search.replace(" ", "")
-            if compact and compact != search:
-                stem = stem.replace(compact, replace.replace(" ", ""))
+    stem = apply_pairs(stem, parse_pairs(replacenames), compact=True)
     return re.sub(r'[\\/:*?"<>|\x00-\x1f]', "", stem).strip()
+
+
+def rename_style(full: str, postscript: str, family: str,
+                 pairs: list[tuple[str, str]]) -> tuple[str, str]:
+    """Apply the pairs to the style part of a full name ('Inter Bold' after
+    the family 'Inter') and of a PostScript name (after the '-'), leaving the
+    family part alone, since the family is renamed separately."""
+    if family and full.startswith(family):
+        full = family + apply_pairs(full[len(family):], pairs)
+    if "-" in postscript:
+        head, tail = postscript.split("-", 1)
+        postscript = f"{head}-{apply_pairs(tail, pairs, compact=True)}"
+    return full, postscript
+
+
+def rename_styles(font: TTFont, replacenames: str) -> None:
+    """Apply the replace names pairs to the style names too, after
+    RemapByOTL.renameFont() has renamed the family.
+
+    Changes the typographic style name (name ID 17), the style part of the
+    full name (4), of a legacy family name like 'Inter SemiBold' (1) and of
+    the PostScript names (6, 20), and the CFF names to match. Name ID 2 is
+    left alone: it must stay Regular, Italic, Bold or Bold Italic for style
+    linking. If the font has no ID 17, one is added with the new style name
+    (and an ID 16 with the family name, which ID 17 goes with).
+    """
+    pairs = parse_pairs(replacenames)
+    if not pairs:
+        return
+    name = font["name"]
+    family = name.getDebugName(16) or name.getDebugName(1) or ""
+    changed = False
+    for record in name.names:
+        text = record.toStr()
+        if record.nameID == 17:
+            new = apply_pairs(text, pairs)
+        elif record.nameID in (1, 4):
+            new = rename_style(text, "", family, pairs)[0]
+        elif record.nameID in (6, 20):
+            new = rename_style("", text, family, pairs)[1]
+        else:
+            continue
+        if new != text:
+            record.string = new
+            changed = True
+
+    if name.getDebugName(17) is None:
+        for record in [r for r in name.names if r.nameID == 2]:
+            style = record.toStr()
+            new_style = apply_pairs(style, pairs)
+            if new_style == style:
+                continue
+            where = (record.platformID, record.platEncID, record.langID)
+            if name.getName(16, *where) is None:
+                legacy = name.getName(1, *where)
+                name.setName(legacy.toStr() if legacy else family, 16, *where)
+            name.setName(new_style, 17, *where)
+            changed = True
+
+    if changed and "CFF " in font:
+        cff = font["CFF "].cff
+        full = name.getName(4, 3, 1) or name.getName(4, 1, 0)
+        postscript = name.getName(6, 3, 1) or name.getName(6, 1, 0)
+        if full:
+            cff[0].rawDict["FullName"] = full.toStr()
+        if postscript:
+            cff.fontNames[0] = postscript.toStr()
+
+
+def variable_filename(inpath: str, old_family: str, new_family: str,
+                      replacenames: str) -> str:
+    """Output name for a variable font, which covers every style and so must
+    not take the default instance's style ('-Regular') from its PostScript
+    name. The family part of the input file name is renamed instead:
+    'GretaSansL[wght].ttf' with the family renamed from 'Greta Sans L' to
+    'Greta Sans' becomes 'GretaSans[wght].ttf'."""
+    source = Path(inpath)
+    stem = source.stem
+    old_compact = old_family.replace(" ", "")
+    new_compact = new_family.replace(" ", "")
+    if old_compact and old_compact in stem:
+        stem = stem.replace(old_compact, new_compact, 1)
+    else:
+        renamed = replace_in_filename(stem, replacenames)
+        if renamed != stem:
+            stem = renamed
+        elif new_compact:
+            # Keep any axis part, as in 'Name[wght,ital]'.
+            stem = new_compact + (stem[stem.index("["):] if "[" in stem else "")
+    stem = re.sub(r'[\\/:*?"<>|\x00-\x1f]', "", stem).strip()
+    return f"{stem or source.stem}{source.suffix}"
 
 
 def output_filename(font: TTFont, inpath: str, renamed: bool,
                     replacenames: str = "") -> str:
     """Name the output after the font's new PostScript name, e.g.
-    'Inter-Bold.otf' -> 'InterFrozen-Bold.otf', with the replace names pairs
-    also applied to the file name. Unrenamed fonts keep their name."""
+    'Inter-Bold.otf' -> 'InterFrozen-Bold.otf'. The PostScript name already
+    has the replace names pairs applied; without one, they're applied to the
+    input file name. Unrenamed fonts keep their name."""
     source = Path(inpath)
-    stem = source.stem
     if renamed:
         postscript_name = font["name"].getDebugName(6) or ""
         postscript_name = re.sub(r'[\\/:*?"<>|\x00-\x1f]', "", postscript_name).strip()
         if postscript_name:
-            stem = postscript_name
-    stem = replace_in_filename(stem, replacenames) or source.stem
+            return f"{postscript_name}{source.suffix}"
+    stem = replace_in_filename(source.stem, replacenames) or source.stem
     return f"{stem}{source.suffix}"
 
 
@@ -684,6 +808,7 @@ def freeze_font(options: SimpleNamespace, folder: str, taken: set[str],
         old_family = names.getDebugName(16) or names.getDebugName(1) or ""
         old_postscript = names.getDebugName(6) or ""
         remapper.renameFont()
+        rename_styles(remapper.ttx, options.replacenames)
         renamed = bool(options.suffix or options.replacenames)
         if renamed:
             # The library leaves the unique ID (name ID 3) on the old names;
@@ -701,8 +826,15 @@ def freeze_font(options: SimpleNamespace, folder: str, taken: set[str],
                     text = text.replace(old_family.replace(" ", ""),
                                         new_family.replace(" ", ""))
                 record.string = text
-        filename = output_filename(remapper.ttx, options.inpath, renamed,
-                                   options.replacenames)
+        if renamed and "fvar" in remapper.ttx:
+            names = remapper.ttx["name"]
+            filename = variable_filename(
+                options.inpath, old_family,
+                names.getDebugName(16) or names.getDebugName(1) or "",
+                options.replacenames)
+        else:
+            filename = output_filename(remapper.ttx, options.inpath, renamed,
+                                       options.replacenames)
         target = output_target(folder, filename, options.inpath, taken, overwrite)
         replacing = os.path.realpath(target) == os.path.realpath(options.inpath)
         # The input is still being read, so never write over it directly:
@@ -750,8 +882,16 @@ def predict_names(path: str, suffix: str, replacenames: str) -> dict:
         full = full.replace(old_family, new_family)
         postscript = postscript.replace(old_family.replace(" ", ""),
                                         new_family.replace(" ", ""))
+        # The style part too, as rename_styles() does when saving.
+        full, postscript = rename_style(full, postscript, new_family,
+                                        parse_pairs(replacenames))
+        if "fvar" in font:  # variable fonts: no style name in the file name
+            return {"filename": variable_filename(path, old_family, new_family,
+                                                  replacenames),
+                    "family": new_family, "full": full, "postscript": postscript}
         stem = re.sub(r'[\\/:*?"<>|\x00-\x1f]', "", postscript).strip()
-        stem = replace_in_filename(stem or Path(path).stem, replacenames)
+        if not stem:
+            stem = replace_in_filename(Path(path).stem, replacenames)
         return {"filename": f"{stem or Path(path).stem}{Path(path).suffix}",
                 "family": new_family, "full": full, "postscript": postscript}
     finally:
@@ -1245,7 +1385,7 @@ class MainWindow(QMainWindow):
         self._names_timer.setSingleShot(True)
         self._names_timer.setInterval(250)
         self._names_timer.timeout.connect(self._update_output_names)
-        for signal in (self.suffix_check.toggled, self.suffix_edit.textChanged,
+        for signal in (self.suffix_edit.textChanged,
                        self.replacenames_edit.textChanged,
                        self.output_edit.textChanged):
             signal.connect(self._names_timer.start)
@@ -1377,11 +1517,8 @@ class MainWindow(QMainWindow):
             return check
 
         add_heading(GROUP_RENAMING)
-        self.suffix_check = add_check("suffix")
         self.suffix_edit = QLineEdit()
-        self.suffix_edit.setPlaceholderText("custom suffix, e.g. SC")
-        self.suffix_edit.setEnabled(False)
-        self.suffix_check.toggled.connect(self.suffix_edit.setEnabled)
+        self.suffix_edit.setPlaceholderText("e.g. SC (empty: no suffix)")
         add_field(LABELS["usesuffix"], self.suffix_edit, "usesuffix")
         self.replacenames_edit = QLineEdit()
         self.replacenames_edit.setPlaceholderText("search1/replace1,search2/replace2")
@@ -1593,8 +1730,8 @@ class MainWindow(QMainWindow):
     def _feature_mismatch(self, existing: list[str], new: list[str]) -> str | None:
         """Why the new fonts cannot be added, or None if they can.
 
-        Fonts may have different features, but each one must contain every
-        feature that is currently ticked.
+        Fonts may have different features; ticked features are frozen only in
+        the fonts that have them.
         """
         unreadable = []
         for path in new:
@@ -1605,12 +1742,6 @@ class MainWindow(QMainWindow):
         if unreadable:
             return ("None of the fonts were added, because these files could "
                     "not be read as fonts:\n\n" + "\n".join(unreadable[:10]))
-        problems = self._missing_ticked(new)
-        if problems:
-            return ("These fonts lack OpenType features that are ticked:\n\n"
-                    + self._describe_missing(problems)
-                    + "\n\nNone of the fonts you just added were added to the "
-                    "list. Untick those features first, or add other fonts.")
         return None
 
     # Drag and drop from Finder: font files, or folders (searched recursively).
@@ -1741,8 +1872,7 @@ class MainWindow(QMainWindow):
         replacenames = self.replacenames_edit.text().strip()
         if replacenames and any(p.count("/") != 1 for p in replacenames.split(",")):
             return None
-        suffix = self.suffix_edit.text().strip() if self.suffix_check.isChecked() else ""
-        return suffix, replacenames
+        return self.suffix_edit.text().strip(), replacenames
 
     def _planned_outputs(self, overwrite: bool) -> list[tuple[str, str | None]]:
         """(input path, output file name) for every font, as Generate would
@@ -1836,7 +1966,7 @@ class MainWindow(QMainWindow):
         self._schedule_preview()
 
     def _update_features_extra(self) -> None:
-        shown = {tag for tag, _, _ in self._font_info["features"]}
+        shown = getattr(self, "_shown_tags", set())
         extra = sorted(self._selected_tags - shown)
         self.features_extra.setText(
             "Also selected, but not in this font: " + ", ".join(extra))
@@ -1848,7 +1978,19 @@ class MainWindow(QMainWindow):
         container = QWidget()
         grid = QGridLayout(container)
         grid.setAlignment(Qt.AlignmentFlag.AlignTop)
-        features = self._font_info["features"]
+        features = list(self._font_info["features"])
+        # Features only in other input fonts can be ticked too (pairs=None).
+        here = {tag for tag, _, _ in features}
+        elsewhere = set()
+        for path in self.font_paths():
+            try:
+                elsewhere |= self._tags(path)
+            except Exception:
+                pass
+        features += [(tag, friendly_feature_name(tag), None)
+                     for tag in elsewhere - here]
+        features.sort(key=lambda f: f[0])
+        self._shown_tags = {tag for tag, _, _ in features}
         if not features:
             text = ("This font has no GSUB features." if self._active_font
                     else "Add a font to list its OpenType features.")
@@ -1856,7 +1998,15 @@ class MainWindow(QMainWindow):
         rows = -(-len(features) // FEATURE_COLUMNS)
         for index, (tag, name, pairs) in enumerate(features):
             count = ""
-            if pairs:
+            if pairs is None:
+                having = [os.path.basename(p) for p in self.font_paths()
+                          if tag in self._tags(p)]
+                count = "not in this font"
+                tip = ("Only in: " + ", ".join(having[:10])
+                       + (f" and {len(having) - 10} more" if len(having) > 10 else "")
+                       + "\n\nTicked, it is frozen in those fonts; select one "
+                       "of them to preview it or choose its substitutions.")
+            elif pairs:
                 tip = ""
             else:
                 count = "not freezable"
@@ -1865,7 +2015,7 @@ class MainWindow(QMainWindow):
                        "it will not change the font.")
             lacking = [os.path.basename(path) for path in self.font_paths()
                        if tag not in self._tags(path)]
-            if lacking:
+            if lacking and pairs is not None:
                 count += ("  ·  " if count else "") + "not in all fonts"
                 tip += ("\n\n" if tip else "") + "Not in: " + ", ".join(lacking[:10]) + (
                     f" and {len(lacking) - 10} more" if len(lacking) > 10 else "")
@@ -1874,7 +2024,9 @@ class MainWindow(QMainWindow):
             box.setProperty("tag", tag)
             box.setChecked(tag in checked)
             box.setToolTip(tip)
-            box.setEnabled(bool(pairs))  # greyed out when it cannot be frozen
+            # Greyed out when it cannot be frozen; features of other fonts
+            # stay tickable.
+            box.setEnabled(pairs is None or bool(pairs))
             box.toggled.connect(self._feature_toggled)
             row = QWidget()
             row_layout = QHBoxLayout(row)
@@ -2142,7 +2294,7 @@ class MainWindow(QMainWindow):
             return fail(
                 "Replace names must be written as search/replace pairs separated "
                 "by commas, for example:\n\nInter/Outer,Display/Headline")
-        use_suffix = self.suffix_check.isChecked()
+        suffix = self.suffix_edit.text().strip()
         return {
             "output": output,
             "features": ",".join(self.selected_features()),
@@ -2150,8 +2302,8 @@ class MainWindow(QMainWindow):
             "lang": pad_tag(self.lang_combo.currentText()) or None,
             "zapnames": self.zapnames_check.isChecked(),
             # The family name gets the custom suffix only, never feature tags.
-            "suffix": bool(use_suffix and self.suffix_edit.text().strip()),
-            "usesuffix": self.suffix_edit.text().strip() if use_suffix else "",
+            "suffix": bool(suffix),   # a custom suffix is used whenever one is typed
+            "usesuffix": suffix,
             "replacenames": replacenames,
             "info": self.info_check.isChecked(),
             "report": self.report_check.isChecked(),
@@ -2168,15 +2320,7 @@ class MainWindow(QMainWindow):
             return
         paths = self.font_paths()
         folder = settings.pop("output")
-        problems = self._missing_ticked(paths)
-        if problems:
-            self._show_error(
-                "Cannot generate fonts",
-                "Every input font must contain the ticked OpenType features. "
-                "These fonts lack some of them:\n\n"
-                + self._describe_missing(problems)
-                + "\n\nUntick those features or remove those fonts.")
-            return
+        missing = self._missing_ticked(paths)  # reported, not an error
 
         clashes = [path for path, name in self._planned_outputs(overwrite=True)
                    if name and os.path.realpath(os.path.join(folder, name))
@@ -2193,6 +2337,11 @@ class MainWindow(QMainWindow):
                         self.font_list.item(row).setText(1, name)
 
         self.log_edit.clear()
+        if missing:
+            self._log("Ticked features missing from some fonts (those fonts "
+                      "are processed without them):")
+            for line in self._describe_missing(missing).split("\n"):
+                self._log("  " + line)
         if overwrite:
             self._log("Overwriting the original font files: "
                       + ", ".join(os.path.basename(path) for path in clashes))
