@@ -98,7 +98,6 @@ HELP = {
 # Labels shown on the controls (the app's option names are kept in HELP keys).
 LABELS = {
     "zapnames": "zap glyph names",
-    "suffix": "add suffix to font family name",
     "usesuffix": "custom suffix",
     "replacenames": "replace names",
     "info": "update font version string",
@@ -114,12 +113,11 @@ POPUP = {
             "use the default language.",
     "zapnames": "Zap glyph names from the font ('post' table version 3, .ttf "
                 "only). Makes the file smaller.",
-    "suffix": "Add the custom suffix to the font family name, e.g. 'Inter' "
-              "becomes 'Inter SC'. OpenType feature tags are never added to "
-              "the family name. Output files and PostScript names follow the "
-              "new family name.",
-    "usesuffix": "The suffix added to the font family name when 'add suffix "
-                 "to font family name' is ticked, e.g. 'SC'.",
+    "usesuffix": "Text added to the font family name, e.g. 'SC' turns "
+                 "'Inter' into 'Inter SC'. Leave empty to keep the family "
+                 "name. The full name, PostScript name and output file name "
+                 "follow the new family name. OpenType feature tags are never "
+                 "added to the family name.",
     "replacenames": "Rename the font family and its styles by replacing "
                     "text in their names, e.g. Inter/Outer renames the Inter "
                     "family to Outer, and Bold/Heavy renames the Bold style to "
@@ -1340,7 +1338,7 @@ class MainWindow(QMainWindow):
         self._names_timer.setSingleShot(True)
         self._names_timer.setInterval(250)
         self._names_timer.timeout.connect(self._update_output_names)
-        for signal in (self.suffix_check.toggled, self.suffix_edit.textChanged,
+        for signal in (self.suffix_edit.textChanged,
                        self.replacenames_edit.textChanged,
                        self.output_edit.textChanged):
             signal.connect(self._names_timer.start)
@@ -1472,11 +1470,8 @@ class MainWindow(QMainWindow):
             return check
 
         add_heading(GROUP_RENAMING)
-        self.suffix_check = add_check("suffix")
         self.suffix_edit = QLineEdit()
-        self.suffix_edit.setPlaceholderText("custom suffix, e.g. SC")
-        self.suffix_edit.setEnabled(False)
-        self.suffix_check.toggled.connect(self.suffix_edit.setEnabled)
+        self.suffix_edit.setPlaceholderText("e.g. SC (empty: no suffix)")
         add_field(LABELS["usesuffix"], self.suffix_edit, "usesuffix")
         self.replacenames_edit = QLineEdit()
         self.replacenames_edit.setPlaceholderText("search1/replace1,search2/replace2")
@@ -1836,8 +1831,7 @@ class MainWindow(QMainWindow):
         replacenames = self.replacenames_edit.text().strip()
         if replacenames and any(p.count("/") != 1 for p in replacenames.split(",")):
             return None
-        suffix = self.suffix_edit.text().strip() if self.suffix_check.isChecked() else ""
-        return suffix, replacenames
+        return self.suffix_edit.text().strip(), replacenames
 
     def _planned_outputs(self, overwrite: bool) -> list[tuple[str, str | None]]:
         """(input path, output file name) for every font, as Generate would
@@ -2237,7 +2231,7 @@ class MainWindow(QMainWindow):
             return fail(
                 "Replace names must be written as search/replace pairs separated "
                 "by commas, for example:\n\nInter/Outer,Display/Headline")
-        use_suffix = self.suffix_check.isChecked()
+        suffix = self.suffix_edit.text().strip()
         return {
             "output": output,
             "features": ",".join(self.selected_features()),
@@ -2245,8 +2239,8 @@ class MainWindow(QMainWindow):
             "lang": pad_tag(self.lang_combo.currentText()) or None,
             "zapnames": self.zapnames_check.isChecked(),
             # The family name gets the custom suffix only, never feature tags.
-            "suffix": bool(use_suffix and self.suffix_edit.text().strip()),
-            "usesuffix": self.suffix_edit.text().strip() if use_suffix else "",
+            "suffix": bool(suffix),   # a custom suffix is used whenever one is typed
+            "usesuffix": suffix,
             "replacenames": replacenames,
             "info": self.info_check.isChecked(),
             "report": self.report_check.isChecked(),
