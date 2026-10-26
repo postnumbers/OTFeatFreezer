@@ -3,6 +3,20 @@
 All notable changes to this project are documented here.
 The format follows Keep a Changelog, and the project uses Semantic Versioning.
 
+## [0.7.0] - 2026-10-24
+### Changed
+- width of OpenType feature listing to match the pane, with hover-over details for OpenType features that are not fully displayed
+- location of output font names to below the output folder field
+- text labels for input and output font names have been shortened
+- OpenType features frozen in the input fonts are now shown as selected in OpenType features pane
+### Added
+- input family name, full name, and PostScript name beside the same for the output font for the selected input font; long names wrap lines
+- button to reset the selected OpenType features to those of the input fonts
+- now shows when glyph names referenced in OpenType features have been zapped
+### Fixed
+- bug when the default OpenType features were previously changed
+- manner in which glyphs are highlighted in blue in the preview pane
+
 ## [0.6.0] - 2026-10-24
 ### Fixed
 - renaming issue for variable font files

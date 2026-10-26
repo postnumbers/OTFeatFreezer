@@ -15,6 +15,7 @@ Install the requirements, then run the script:
 from __future__ import annotations
 
 import contextlib
+import html
 import io
 import logging
 import os
@@ -26,22 +27,25 @@ from pathlib import Path
 from types import SimpleNamespace
 
 try:
+    from fontTools import agl
     from fontTools import unicodedata as ft_unicodedata
     from fontTools.pens.qtPen import QtPen
     from fontTools.ttLib import TTFont
     from opentype_feature_freezer import RemapByOTL
-    from PySide6.QtCore import QByteArray, QSettings, Qt, QThread, QTimer, Signal
-    from PySide6.QtCore import QPoint, QSize
+    from PySide6.QtCore import QByteArray, QEvent, QSettings, Qt, QThread, QTimer, Signal
+    from PySide6.QtCore import QPoint, QPointF, QRectF, QSize
     from PySide6.QtGui import (
         QPainter, QPainterPath, QPixmap, QTransform,
-        QColor, QFont, QFontDatabase, QIcon, QPalette, QTextCursor)
+        QColor, QFont, QFontDatabase, QIcon, QKeySequence, QPalette, QTextCursor,
+        QTextDocument)
     from PySide6.QtWidgets import (
         QAbstractItemView, QApplication, QCheckBox, QComboBox, QDialog,
         QDialogButtonBox, QFileDialog, QFrame,
         QGridLayout, QHBoxLayout, QHeaderView, QLabel, QLineEdit, QListWidget,
-        QListWidgetItem, QMainWindow, QSizePolicy, QTreeWidget, QTreeWidgetItem,
+        QListWidgetItem, QMainWindow, QMenu, QSizePolicy, QTreeWidget, QTreeWidgetItem,
         QMessageBox, QPlainTextEdit, QProgressBar, QPushButton, QScrollArea,
-        QSpinBox, QSplitter, QTextEdit, QToolButton, QVBoxLayout, QWidget,
+        QSpinBox, QSplitter, QStyle, QStyledItemDelegate, QStyleOptionViewItem,
+        QTextEdit, QToolButton, QVBoxLayout, QWidget,
     )
 except ImportError as exc:  # pragma: no cover
     sys.exit(
@@ -229,6 +233,9 @@ QListView::indicator {
 QListView::indicator:checked {
     background-color: %(accent)s; border-color: %(accent)s; image: url(%(check)s);
 }
+QListView::indicator:indeterminate { image: url(%(dash)s); }
+QListView::indicator:disabled { background-color: %(bg)s; }
+QListView::item:disabled { color: %(muted)s; }
 QPushButton#small { padding: 1px 8px; color: %(muted)s; }
 QListWidget, QTreeWidget, QCheckBox#feature { font-size: %(list_pt)spt; }
 QHeaderView::section {
@@ -267,6 +274,7 @@ _ICON_SHAPES = {  # name: (outline, stroke width); colours are set in theme_icon
              "M6.15 6.25a1.9 1.9 0 1 1 2.65 1.75c-.5.22-.8.62-.8 1.15v.35"
              "M8 11.35v.15", 1.3),
     "check": ("M3.5 8.5l3 3 6-7", 2),
+    "dash": ("M4.5 8h7", 2),
     "arrow_down": ("M4 6l4 4 4-4", 2),
     "arrow_up": ("M4 10l4-4 4 4", 2),
     "sun": ("M8 5.2a2.8 2.8 0 1 0 0 5.6a2.8 2.8 0 1 0 0-5.6M8 1v1.6M8 13.4V15"
@@ -283,7 +291,8 @@ def theme_icons(name: str) -> dict:
         _ICON_FOLDER = tempfile.mkdtemp(prefix="featfreeze_gui_")
     paths = {}
     for shape, (outline, width) in _ICON_SHAPES.items():
-        color = THEMES[name][{"check": "on_accent", "help": "muted"}.get(shape, "fg")]
+        color = THEMES[name][{"check": "on_accent", "help": "muted",
+                              "dash": "muted"}.get(shape, "fg")]
         path = os.path.join(_ICON_FOLDER, f"{shape}_{name}.svg")
         with open(path, "w", encoding="utf-8") as handle:
             handle.write(
@@ -342,8 +351,83 @@ def pad_tag(tag: str) -> str:
 
 
 def empty_font_info() -> dict:
-    return {"features": [], "scripts": {}, "cmap": {},
-            "ligatures": {"standard": [], "coding": []}}
+    return {"features": [], "scripts": {}, "cmap": {}, "frozen": {},
+            "zapped": set(), "ligatures": {"standard": [], "coding": []}}
+
+
+def zapped_glyphs(font: TTFont) -> set[str]:
+    """Glyph names made up by fontTools because the font's names were zapped
+    ('post' table version 3 in a TrueType font): 'glyph00123' and the like."""
+    if "post" not in font or font["post"].formatType != 3.0:
+        return set()
+    if "CFF " in font or "CFF2" in font:  # CFF fonts keep names of their own
+        return set()
+    return {name for name in font.getGlyphOrder()
+            if re.fullmatch(r"glyph\d+", name)}
+
+
+def undeterminable(source: str, target: str, encoded, zapped) -> bool:
+    """True when zapped glyph names hide whether a substitution was frozen:
+    the source glyph has no character and no real name, the target has one."""
+    return source in zapped and source not in encoded and target in encoded
+
+
+def in_effect(source: str, target: str, encoded) -> bool:
+    """Whether a substitution already shows in the font as it is: frozen, or
+    from a glyph without a character (freezing it changes nothing)."""
+    return source not in encoded or is_frozen(source, target, encoded)
+
+
+def pair_wanted(tag: str, glyph: str, effect: bool, ticked, choices) -> bool:
+    """Whether a substitution of feature `tag` should be frozen in the output.
+
+    `choices` holds the user's choices: "off" and "on" map feature tags to
+    source glyphs unticked or ticked in the substitution list, and features in
+    "keep" leave glyphs nobody touched as they are in each font (`effect`).
+    """
+    if tag not in ticked or glyph in choices.get("off", {}).get(tag, ()):
+        return False
+    if tag in choices.get("keep", ()) and not effect:
+        return glyph in choices.get("on", {}).get(tag, ())
+    return True
+
+
+def frozen_features(path: str) -> set[str]:
+    """Tags of the features already frozen (fully or partly) into a font."""
+    font = TTFont(path, lazy=True)
+    try:
+        if "GSUB" not in font:
+            return set()
+        encoded = encoded_glyphs(font.getBestCmap() or {})
+        gsub = font["GSUB"].table
+        lookups = gsub.LookupList.Lookup if gsub.LookupList else []
+        found = set()
+        for record in gsub.FeatureList.FeatureRecord if gsub.FeatureList else []:
+            if record.FeatureTag in found:
+                continue
+            for index in record.Feature.LookupListIndex:
+                if any(is_frozen(a, b, encoded)
+                       for a, b in lookup_pairs(lookups[index])):
+                    found.add(record.FeatureTag)
+                    break
+        return found
+    finally:
+        font.close()
+
+
+def lookup_pairs(lookup) -> list[tuple[str, str]]:
+    """The single and alternate substitutions of a lookup (an alternate
+    substitution gives its first alternate, as the freezer does)."""
+    pairs = []
+    for subtable in lookup.SubTable:
+        if subtable.LookupType == 7:
+            subtable = subtable.ExtSubTable
+        if subtable.LookupType == 1:
+            pairs.extend(subtable.mapping.items())
+        elif subtable.LookupType == 3:
+            pairs.extend((glyph, alternates[0]) for glyph, alternates
+                         in subtable.alternates.items() if alternates)
+    return pairs
 
 
 def find_ligatures(font: TTFont, cmap: dict, limit: int = 40) -> dict:
@@ -465,6 +549,20 @@ def read_font_info(path: str) -> dict:
                     entry["name"] = f"Character Variant {int(tag[2:])}"
                 else:
                     entry["name"] = FEATURE_NAMES.get(tag, "")
+        # Substitutions already frozen into this font, by feature (source
+        # glyphs), and glyph names that were zapped.
+        encoded = encoded_glyphs(info["cmap"])
+        info["zapped"] = zapped_glyphs(font)
+        for tag, entry in features.items():
+            frozen = {source for source, target in entry["pairs"].items()
+                      if is_frozen(source, target, encoded)}
+            if frozen:
+                # Fully frozen when every substitution that remaps a character
+                # (and whose state can be told) is frozen.
+                remapping = {source for source, target in entry["pairs"].items()
+                             if source in encoded or source in frozen}
+                info["frozen"][tag] = {"glyphs": frozen,
+                                       "full": remapping <= frozen}
         info["features"] = [
             (tag, features[tag]["name"], features[tag]["pairs"])
             for tag in sorted(features)
@@ -718,15 +816,41 @@ def output_filename(font: TTFont, inpath: str, renamed: bool,
     return f"{stem}{source.suffix}"
 
 
-def remap_glyphs(remapper: RemapByOTL, disabled: dict | None = None) -> None:
-    """Remap the font's cmap like RemapByOTL.remapByOTL(), but skip excluded
-    substitutions.
+def is_frozen(sub_in: str, sub_out: str, encoded) -> bool:
+    """True when a substitution was already frozen into the font.
 
-    `disabled` maps a feature tag to the source glyph names whose substitution
-    should not be frozen. A lookup shared by several ticked features skips a
-    glyph only when every one of those features excludes it.
+    `encoded` maps glyph names to the characters they have. Frozen means: the
+    source glyph has no character, the result glyph has the character the
+    source glyph's name stands for (e.g. 'a' -> 'a.1' with U+0061 on 'a.1'),
+    and the source is not just a variant of the result (as in pnum's
+    'space.tf' -> 'space', which is a design choice, not a frozen feature).
     """
-    disabled = disabled or {}
+    if sub_in in encoded or sub_out not in encoded:
+        return False
+    if sub_in.startswith(sub_out + "."):
+        return False
+    meant = agl.toUnicode(sub_in)
+    return len(meant) == 1 and ord(meant) in encoded[sub_out]
+
+
+def encoded_glyphs(cmap: dict) -> dict:
+    """{glyph name: set of code points} from a code point -> glyph map."""
+    result: dict[str, set[int]] = {}
+    for codepoint, glyph in cmap.items():
+        result.setdefault(glyph, set()).add(codepoint)
+    return result
+
+
+def remap_glyphs(remapper: RemapByOTL, choices: dict | None = None) -> None:
+    """Remap the font's cmap like RemapByOTL.remapByOTL(), following the
+    user's choices (see pair_wanted).
+
+    Ticked features mean "frozen in the output". Substitutions already frozen
+    into the font stay frozen when a ticked feature wants them, and are
+    reversed (the original glyph gets its character back) otherwise. Other
+    substitutions are frozen when a ticked feature using them wants them.
+    """
+    choices = choices or {}
     remapper.initSubs()
     remapper.filterFeatureIndex()
     remapper.filterLookupList()
@@ -734,37 +858,62 @@ def remap_glyphs(remapper: RemapByOTL, disabled: dict | None = None) -> None:
     if "GSUB" not in font:
         return  # nothing to freeze; the cmap stays as it is
     gsub = font["GSUB"].table
+    lookups = gsub.LookupList.Lookup if gsub.LookupList else []
+    ticked = set(remapper.filterByFeatures)
+    with_unicode = {glyph for table in font["cmap"].tables
+                    for glyph in table.cmap.values()}
+    encoded = encoded_glyphs(font.getBestCmap() or {})
+    subs = remapper.subs1
+
+    # 1. Frozen substitutions, in any feature of any script: keep or reverse.
+    holders: dict[tuple[str, str], set[str]] = {}  # frozen pair -> features
+    for record in gsub.FeatureList.FeatureRecord if gsub.FeatureList else []:
+        for lookup_index in record.Feature.LookupListIndex:
+            for pair in lookup_pairs(lookups[lookup_index]):
+                if is_frozen(*pair, encoded):
+                    holders.setdefault(pair, set()).add(record.FeatureTag)
+    # Reversing gives back the original glyph only for the character its
+    # name stands for: the frozen glyph may also serve other characters
+    # (Inter's 'a.1' is used by U+0430 and private-use code points too).
+    restore: dict[int, str] = {}  # code point -> original glyph
+    # A feature ticked by hand, or a glyph ticked in a list, keeps a frozen
+    # substitution; failing that, an unticked feature or glyph reverses it;
+    # otherwise it stays as it is in features ticked because already frozen.
+    off = choices.get("off", {})
+    for (sub_in, sub_out), tags in holders.items():
+        wanted = any(pair_wanted(tag, sub_in, False, ticked, choices) for tag in tags)
+        if not wanted:
+            unwanted = any(tag not in ticked or sub_in in off.get(tag, ())
+                           for tag in tags)
+            wanted = not unwanted and any(
+                pair_wanted(tag, sub_in, True, ticked, choices) for tag in tags)
+        if not wanted:
+            restore.setdefault(ord(agl.toUnicode(sub_in)), sub_in)
+    restored = list(restore.values())  # run through step 2 as well
+
+    # 2. The other substitutions of the ticked features, in lookup order.
     users: dict[int, set[str]] = {}  # lookup index -> ticked features using it
     for index in remapper.FeatureIndex:
         record = gsub.FeatureList.FeatureRecord[index]
-        if record.FeatureTag in remapper.filterByFeatures:
+        if record.FeatureTag in ticked:
             for lookup_index in record.Feature.LookupListIndex:
                 users.setdefault(lookup_index, set()).add(record.FeatureTag)
-
-    subs = remapper.subs1
     for lookup_index in remapper.LookupList:
         tags = users.get(lookup_index, set())
-        blocked = (set.intersection(*(set(disabled.get(tag, ())) for tag in tags))
-                   if tags else set())
-        for subtable in gsub.LookupList.Lookup[lookup_index].SubTable:
-            if subtable.LookupType == 7:
-                subtable = subtable.ExtSubTable
-            if subtable.LookupType == 1:
-                pairs = list(subtable.mapping.items())
-            elif subtable.LookupType == 3:  # alternates: take the first, as the library does
-                pairs = [(glyph, alternates[0]) for glyph, alternates
-                         in subtable.alternates.items() if alternates]
-            else:
+        for sub_in, sub_out in lookup_pairs(lookups[lookup_index]):
+            if is_frozen(sub_in, sub_out, encoded):
+                continue  # settled above
+            effect = sub_in not in encoded
+            if not any(pair_wanted(tag, sub_in, effect, ticked, choices)
+                       for tag in tags):
                 continue
-            for sub_in, sub_out in pairs:
-                if sub_in in blocked:
-                    continue
-                for i, glyph in enumerate(subs):
+            for glyphs in (subs, restored):
+                for i, glyph in enumerate(glyphs):
                     if glyph == sub_in:
-                        subs[i] = sub_out
+                        glyphs[i] = sub_out
+    overrides = dict(zip(restore, restored))
+    remapper.cmap_overrides = overrides
 
-    with_unicode = {glyph for table in font["cmap"].tables
-                    for glyph in table.cmap.values()}
     names = []
     for sub_in, sub_out in zip(remapper.subs0, subs):
         remapper.substitution_mapping[sub_in] = sub_out
@@ -779,6 +928,11 @@ def remap_glyphs(remapper: RemapByOTL, disabled: dict | None = None) -> None:
             FREEZER_LOGGER.info("[applySubstitutions] Remap: '%s' -> '%s'",
                                 sub_in, sub_out)
     remapper.remapCmaps()
+    for table in font["cmap"].tables:
+        for codepoint, glyph in overrides.items():
+            if codepoint in table.cmap:
+                table.cmap[codepoint] = glyph
+    names.extend(overrides.values())
     if remapper.options.names:
         print(" ".join(names))
 
@@ -796,14 +950,14 @@ def output_target(folder: str, filename: str, inpath: str, taken: set[str],
 
 
 def freeze_font(options: SimpleNamespace, folder: str, taken: set[str],
-                disabled: dict | None = None, overwrite: bool = False) -> str | None:
+                choices: dict | None = None, overwrite: bool = False) -> str | None:
     """Freeze one font into `folder`. Returns the saved path, or None on failure."""
     remapper = RemapByOTL(options)
     remapper.openFont()
     if not remapper.success:
         return None
     try:
-        remap_glyphs(remapper, disabled)
+        remap_glyphs(remapper, choices)
         names = remapper.ttx["name"]
         old_family = names.getDebugName(16) or names.getDebugName(1) or ""
         old_postscript = names.getDebugName(6) or ""
@@ -899,7 +1053,7 @@ def predict_names(path: str, suffix: str, replacenames: str) -> dict:
 
 
 def build_preview_font(path: str, features: str, script, lang, family: str,
-                       disabled: dict | None = None):
+                       choices: dict | None = None):
     """Freeze `path` in memory under a unique family name.
 
     Returns (font bytes, set of code points whose glyph changed).
@@ -913,10 +1067,11 @@ def build_preview_font(path: str, features: str, script, lang, family: str,
     try:
         font = remapper.ttx
         before = dict(font.getBestCmap() or {})
-        remap_glyphs(remapper, disabled)
+        remap_glyphs(remapper, choices)
         mapping = remapper.substitution_mapping
+        overrides = getattr(remapper, "cmap_overrides", {})
         changed = {cp for cp, glyph in before.items()
-                   if mapping.get(glyph, glyph) != glyph}
+                   if overrides.get(cp, mapping.get(glyph, glyph)) != glyph}
 
         # A unique family name stops the OS from substituting an installed copy.
         name = font["name"]
@@ -1013,7 +1168,7 @@ class FreezeWorker(QThread):
                                 "suffix", "usesuffix", "replacenames",
                                 "info", "names", "verbose")})
                         outpath = freeze_font(options, self._folder, taken,
-                                              settings["disabled"], self._overwrite)
+                                              settings["choices"], self._overwrite)
                     except Exception as exc:  # keep going with the other fonts
                         print(f"ERROR: {type(exc).__name__}: {exc}")
                     if outpath:
@@ -1042,6 +1197,165 @@ def _label(text: str, role: str, indent: int = 0) -> QLabel:
     if indent:
         label.setContentsMargins(indent, 0, 0, 0)
     return label
+
+
+class PreviewEdit(QTextEdit):
+    """Sample text box that colours changed characters glyph by glyph.
+
+    Qt's own highlighting (extra selections) colours a strip as wide as each
+    character, which cuts slanted italics and ligatures in two and tints the
+    overhang of unchanged neighbours. Formatting the text instead makes Qt
+    reshape at every colour change, losing kerning and ligatures. So the text
+    is drawn as usual and each glyph that shows a changed character is then
+    painted again, whole, in the highlight colour."""
+
+    def __init__(self, parent=None) -> None:
+        super().__init__(parent)
+        self._ranges: list[tuple[int, int]] = []  # [start, end) document positions
+        self._color = QColor()
+        self._background = QColor()
+
+    def set_highlight(self, ranges, color: QColor, background: QColor) -> None:
+        self._ranges = list(ranges)
+        self._color = QColor(color)
+        self._background = QColor(background)
+        self.viewport().update()
+
+    def _unselected(self) -> list[tuple[int, int]]:
+        """Highlight ranges minus the user's selection (drawn by Qt)."""
+        cursor = self.textCursor()
+        if not cursor.hasSelection():
+            return self._ranges
+        low, high = cursor.selectionStart(), cursor.selectionEnd()
+        pieces = []
+        for start, end in self._ranges:
+            if start < low:
+                pieces.append((start, min(end, low)))
+            if end > high:
+                pieces.append((max(start, high), end))
+        return pieces
+
+    def paintEvent(self, event) -> None:
+        super().paintEvent(event)
+        ranges = self._unselected()
+        if not ranges:
+            return
+        document = self.document()
+        scroll = QPointF(self.horizontalScrollBar().value(),
+                         self.verticalScrollBar().value())
+        visible = QRectF(event.rect()).translated(scroll)
+        painter = QPainter(self.viewport())
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        for start, end in ranges:
+            block = document.findBlock(start)
+            while block.isValid() and block.position() < end:
+                layout = block.layout()
+                origin = layout.position()
+                if layout.boundingRect().translated(origin).intersects(visible):
+                    first = max(start, block.position()) - block.position()
+                    last = min(end, block.position() + block.length()) - block.position()
+                    runs = []
+                    for index in range(layout.lineCount()):
+                        line = layout.lineAt(index)
+                        low = max(first, line.textStart())
+                        high = min(last, line.textStart() + line.textLength())
+                        if high > low:
+                            runs += line.glyphRuns(low, high - low)
+                    at = origin - scroll
+                    # Clear the glyphs first so no dark edge shows round the
+                    # colour, then paint them in the highlight colour.
+                    for color in (self._background, self._background, self._color):
+                        painter.setPen(color)
+                        for run in runs:
+                            painter.drawGlyphRun(at, run)
+                block = block.next()
+        painter.end()
+
+
+class NameLabel(QLabel):
+    """Selectable font name that wraps inside a narrow column.
+
+    Font names often have no spaces (PostScript names never do), so invisible
+    break points are added after hyphens and underscores and between a lower-
+    case letter and a capital. Copying gives back the name without them."""
+
+    BREAK = "\u200b"  # zero-width space
+
+    def __init__(self, text: str = "") -> None:
+        super().__init__()
+        self.setWordWrap(True)
+        self.setTextFormat(Qt.TextFormat.PlainText)
+        self.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        self.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.customContextMenuRequested.connect(self._menu)
+        policy = self.sizePolicy()
+        policy.setHorizontalPolicy(QSizePolicy.Policy.Ignored)
+        self.setSizePolicy(policy)
+        self.setText(text)
+
+    def setText(self, text: str) -> None:  # noqa: N802 (Qt naming)
+        self._plain = text
+        shown = re.sub(r"([-_./])", r"\1" + self.BREAK, text)
+        shown = re.sub(r"(?<=[a-z0-9])(?=[A-Z])", self.BREAK, shown)
+        super().setText(shown)
+
+    def plain_text(self) -> str:
+        return self._plain
+
+    def _copy(self) -> None:
+        text = self.selectedText() or self.text()
+        QApplication.clipboard().setText(text.replace(self.BREAK, ""))
+
+    def keyPressEvent(self, event) -> None:  # noqa: N802
+        if event.matches(QKeySequence.StandardKey.Copy):
+            self._copy()
+        else:
+            super().keyPressEvent(event)
+
+    def _menu(self, point) -> None:
+        menu = QMenu(self)
+        menu.addAction("Copy", self._copy)
+        menu.exec(self.mapToGlobal(point))
+
+
+class ElidingCheckBox(QCheckBox):
+    """A checkbox whose label is shortened with '…' to fit its width; when
+    shortened, the full label is added to its tooltip."""
+
+    def __init__(self, text: str, parent=None):
+        super().__init__(text, parent)
+        self._full_text = text
+        self._base_tip = ""
+        policy = self.sizePolicy()
+        policy.setHorizontalPolicy(QSizePolicy.Policy.Ignored)
+        self.setSizePolicy(policy)
+        self.setMinimumWidth(40)
+
+    def setToolTip(self, tip: str) -> None:  # noqa: N802 (Qt naming)
+        self._base_tip = tip
+        self._fit()
+
+    def resizeEvent(self, event) -> None:  # noqa: N802
+        super().resizeEvent(event)
+        self._fit()
+
+    def changeEvent(self, event) -> None:  # noqa: N802
+        super().changeEvent(event)
+        if event.type() in (event.Type.FontChange, event.Type.StyleChange):
+            self._fit()
+
+    def _fit(self) -> None:
+        metrics = self.fontMetrics()
+        # Width taken by the box itself and its spacing.
+        overhead = super().sizeHint().width() - metrics.horizontalAdvance(super().text())
+        room = max(10, self.width() - overhead - 2)
+        shown = metrics.elidedText(self._full_text, Qt.TextElideMode.ElideRight, room)
+        if shown != super().text():
+            super().setText(shown)
+        tip = self._base_tip
+        if shown != self._full_text:
+            tip = self._full_text + ("\n\n" + tip if tip else "")
+        super().setToolTip(tip)
 
 
 class FontTable(QTreeWidget):
@@ -1158,22 +1472,71 @@ class GlyphPainter:
         return pixmap
 
 
+class RichItemDelegate(QStyledItemDelegate):
+    """Draws list items that carry HTML (in HTML_ROLE) as rich text, so part
+    of an item can be struck through; other items are drawn as usual."""
+
+    HTML_ROLE = Qt.ItemDataRole.UserRole + 1
+
+    def paint(self, painter, option, index) -> None:
+        markup = index.data(self.HTML_ROLE)
+        if not markup:
+            super().paint(painter, option, index)
+            return
+        opt = QStyleOptionViewItem(option)
+        self.initStyleOption(opt, index)
+        widget = opt.widget
+        style = widget.style() if widget else QApplication.style()
+        text_rect = style.subElementRect(
+            QStyle.SubElement.SE_ItemViewItemText, opt, widget)
+        opt.text = ""
+        style.drawControl(QStyle.ControlElement.CE_ItemViewItem, opt, painter, widget)
+        # The application palette holds the theme's colours (a style sheet
+        # may hide them from the option's palette).
+        enabled = bool(index.flags() & Qt.ItemFlag.ItemIsEnabled)
+        group = (QPalette.ColorGroup.Normal if enabled
+                 else QPalette.ColorGroup.Disabled)
+        role = (QPalette.ColorRole.HighlightedText
+                if enabled and opt.state & QStyle.StateFlag.State_Selected
+                else QPalette.ColorRole.Text)
+        color = QApplication.palette().color(group, role).name()
+        document = QTextDocument()
+        document.setDefaultFont(opt.font)
+        document.setDocumentMargin(0)
+        document.setHtml(f'<span style="color:{color}; white-space:pre">{markup}</span>')
+        painter.save()
+        painter.setClipRect(text_rect)
+        painter.translate(text_rect.left() + 3, text_rect.top()
+                          + (text_rect.height() - document.size().height()) / 2)
+        document.drawContents(painter)
+        painter.restore()
+
+
 class SubstitutionDialog(QDialog):
-    """Lists one feature's glyph substitutions with a checkbox each."""
+    """Lists one feature's glyph substitutions with a checkbox each: ticked
+    means frozen in the output fonts."""
 
     GLYPH_SIZE = 34
-    changed = Signal(object)  # the set of excluded source glyphs, on every change
+    ZAPPED = "(glyph prev. zapped)"
+    changed = Signal(object)  # {source glyph: ticked}, on every change
 
     def __init__(self, parent, font_path: str, tag: str, name: str,
-                 pairs: dict, cmap: dict, disabled: set[str]):
+                 pairs: dict, cmap: dict, states: dict, zapped: set[str],
+                 frozen: set[str]):
         super().__init__(parent)
         self.setWindowTitle(f"{tag} substitutions")
-        self.resize(560, 640)
+        self.resize(600, 640)
         layout = QVBoxLayout(self)
         layout.addWidget(_label(f"{tag}  ·  {name}" if name else tag, "title"))
-        layout.addWidget(_label(
-            f"Substitutions in {os.path.basename(font_path)}. Untick one to "
-            "leave that glyph unchanged in all output fonts.", "hint"))
+        hint = (f"Substitutions in {os.path.basename(font_path)}. Ticked "
+                "glyphs are frozen in all output fonts; untick one to leave "
+                "it unchanged, or, if it was already frozen, to give the "
+                "character its original glyph back.")
+        if any(state is None for state in states.values()):
+            hint += (" Greyed-out substitutions involve zapped glyph names, "
+                     "which hide whether they were frozen, so they are left "
+                     "as they are.")
+        layout.addWidget(_label(hint, "hint"))
         self.filter_edit = QLineEdit()
         self.filter_edit.setPlaceholderText("Filter by glyph name or character")
         self.filter_edit.textChanged.connect(self._filter)
@@ -1183,23 +1546,52 @@ class SubstitutionDialog(QDialog):
         size = self.GLYPH_SIZE
         self.list.setIconSize(QSize(size * 3, size))
         self.list.setUniformItemSizes(True)
+        self.list.setItemDelegate(RichItemDelegate(self.list))
         layout.addWidget(self.list, 1)
         char_of = {}
         for codepoint in sorted(cmap, reverse=True):
             char_of[cmap[codepoint]] = codepoint
         color = self.palette().color(QPalette.ColorRole.Text)
         painter = GlyphPainter(font_path)
+
+        def shown(glyph: str, rich: bool) -> str:
+            if glyph not in zapped:
+                return html.escape(glyph) if rich else glyph
+            return (f"<s>{html.escape(glyph)}</s> {self.ZAPPED}" if rich
+                    else f"{glyph} {self.ZAPPED}")
+
         try:
             for source, target in pairs.items():
-                text = f"{source}  →  {target}"
-                if source in char_of:
-                    text += f"     {chr(char_of[source])}  U+{char_of[source]:04X}"
+                extra = ""
+                if source in frozen:  # its character went to the frozen glyph
+                    codepoint = ord(agl.toUnicode(source))
+                    extra += f"     {chr(codepoint)}  U+{codepoint:04X}"
+                elif source in char_of:
+                    extra += f"     {chr(char_of[source])}  U+{char_of[source]:04X}"
+                if source in frozen:
+                    extra += "     already frozen"
+                text = f"{shown(source, False)}  →  {shown(target, False)}{extra}"
+                state = states.get(source, True)
+                ink = color if state is not None else QApplication.palette().color(
+                    QPalette.ColorGroup.Disabled, QPalette.ColorRole.Text)
                 item = QListWidgetItem(QIcon(self._pair_picture(
-                    painter, source, target, color)), text)
+                    painter, source, target, ink)), text)
                 item.setData(Qt.ItemDataRole.UserRole, source)
-                item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
-                item.setCheckState(Qt.CheckState.Unchecked if source in disabled
-                                   else Qt.CheckState.Checked)
+                if source in zapped or target in zapped:
+                    item.setData(RichItemDelegate.HTML_ROLE,
+                                 f"{shown(source, True)}  →  {shown(target, True)}"
+                                 f"{html.escape(extra)}")
+                if state is None:
+                    item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsEnabled
+                                  & ~Qt.ItemFlag.ItemIsUserCheckable)
+                    item.setCheckState(Qt.CheckState.PartiallyChecked)
+                    item.setToolTip("Zapped glyph names hide whether this "
+                                    "substitution was already frozen, so it "
+                                    "is left as it is.")
+                else:
+                    item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
+                    item.setCheckState(Qt.CheckState.Checked if state
+                                       else Qt.CheckState.Unchecked)
                 self.list.addItem(item)
         finally:
             painter.close()
@@ -1218,7 +1610,7 @@ class SubstitutionDialog(QDialog):
         row.addWidget(buttons)
         layout.addLayout(row)
         self.list.itemChanged.connect(self._update_count)
-        self.list.itemChanged.connect(lambda *_: self.changed.emit(self.disabled()))
+        self.list.itemChanged.connect(lambda *_: self.changed.emit(self.states()))
         self._update_count()
 
     def _pair_picture(self, painter: GlyphPainter, source: str, target: str,
@@ -1251,19 +1643,32 @@ class SubstitutionDialog(QDialog):
         for item in self._items():
             item.setHidden(bool(text) and text not in item.text().lower())
 
+    def _changeable(self, item) -> bool:
+        return bool(item.flags() & Qt.ItemFlag.ItemIsUserCheckable)
+
     def _set_visible(self, enabled: bool) -> None:
         state = Qt.CheckState.Checked if enabled else Qt.CheckState.Unchecked
+        self.list.blockSignals(True)  # one update for the lot
         for item in self._items():
-            if not item.isHidden():
+            if not item.isHidden() and self._changeable(item):
                 item.setCheckState(state)
+        self.list.blockSignals(False)
+        self._update_count()
+        self.changed.emit(self.states())
 
     def _update_count(self, *_args) -> None:
         on = sum(item.checkState() == Qt.CheckState.Checked for item in self._items())
-        self.count_label.setText(f"{on} of {self.list.count()} enabled")
+        fixed = sum(not self._changeable(item) for item in self._items())
+        text = f"{on} of {self.list.count()} frozen"
+        if fixed:
+            text += f", {fixed} left as they are"
+        self.count_label.setText(text)
 
-    def disabled(self) -> set[str]:
-        return {item.data(Qt.ItemDataRole.UserRole) for item in self._items()
-                if item.checkState() != Qt.CheckState.Checked}
+    def states(self) -> dict:
+        """{source glyph: ticked} for the substitutions that can be changed."""
+        return {item.data(Qt.ItemDataRole.UserRole):
+                item.checkState() == Qt.CheckState.Checked
+                for item in self._items() if self._changeable(item)}
 
 
 def _with_help(widget: QWidget, text: str, name: str = "") -> QWidget:
@@ -1300,7 +1705,11 @@ class MainWindow(QMainWindow):
         self._active_font: str | None = None   # the font shown in features/preview
         self._font_info = empty_font_info()
         self._selected_tags: set[str] = set()  # ticked features, kept across fonts
-        self._disabled: dict[str, set[str]] = {}  # tag -> excluded source glyphs
+        # Choices in the substitution lists (see pair_wanted): "off"/"on" map a
+        # tag to source glyphs unticked/ticked; features in "keep" (ticked
+        # because they were already frozen) leave untouched glyphs as they are.
+        self._choices: dict = {"off": {}, "on": {}, "keep": set()}
+        self._frozen_cache: dict[str, set[str]] = {}  # path -> frozen features
         self._previewing_tag: str | None = None   # feature whose dialog is open
         self._last_font_folder = ""                # where "Add fonts…" last looked
         self._status_text = ("", "")               # preview status: before / after count
@@ -1341,10 +1750,11 @@ class MainWindow(QMainWindow):
         layout.addLayout(self._build_header())
         # Three columns (the third a little wider):
         #   columns 1-2, top:   font files to process (with output names)
-        #   column 1, below:    options (renaming and PostScript name at the bottom)
+        #   column 1, below:    names of the selected font, then options
         #   column 2, below:    OpenType features
         #   column 3:           preview and processing output
         files = self._build_files_side()
+        names = self._build_names()
         options = self._build_options()
         features = self._build_features()
         output_side = self._build_output_side()
@@ -1354,20 +1764,25 @@ class MainWindow(QMainWindow):
         grid.setHorizontalSpacing(24)
         grid.setVerticalSpacing(16)
         grid.addWidget(files, 0, 0, 1, 2)
-        grid.addWidget(options, 1, 0)
-        grid.addWidget(features, 1, 1)
-        grid.addWidget(output_side, 0, 2, 2, 1)
+        grid.addWidget(names, 1, 0)
+        grid.addWidget(options, 2, 0)
+        grid.addWidget(features, 1, 1, 2, 1)
+        grid.addWidget(output_side, 0, 2, 3, 1)
         # Columns 1 and 2 share one width; column 3 (preview) is a quarter wider.
         for column, stretch in enumerate((4, 4, 5)):
             grid.setColumnStretch(column, stretch)
         grid.setRowStretch(0, 2)
-        grid.setRowStretch(1, 3)
+        grid.setRowStretch(2, 3)
         # Ignore content widths so the columns stay equal at any window width.
-        for widget in (files, options, features, output_side):
+        for widget in (files, names, options, features, output_side):
             policy = widget.sizePolicy()
             policy.setHorizontalPolicy(QSizePolicy.Policy.Ignored)
             widget.setSizePolicy(policy)
         self._control_panels = [files, features, options]
+        # Wrapped names grow taller as the column narrows; Qt's minimum sizes
+        # ignore that, so the names and options would get squeezed together.
+        self._names_panel, self._options_panel = names, options
+        names.installEventFilter(self)
         layout.addWidget(body, 1)
         self.setCentralWidget(central)
 
@@ -1459,6 +1874,8 @@ class MainWindow(QMainWindow):
             "OpenType features", POPUP["features"])
         self.features_area = QScrollArea()
         self.features_area.setWidgetResizable(True)
+        self.features_area.setHorizontalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self.features_area.setMinimumHeight(150)
         box.addWidget(self.features_area, 1)
         self.features_extra = _label("", "hint")
@@ -1469,11 +1886,46 @@ class MainWindow(QMainWindow):
         all_button.clicked.connect(lambda: self._set_all_features(True))
         none_button = QPushButton("Select none")
         none_button.clicked.connect(lambda: self._set_all_features(False))
+        reset_button = QPushButton("Reset to input font")
+        reset_button.setToolTip(
+            "Tick only the features already frozen into the input fonts and "
+            "undo all changes made in the substitution lists, so the output "
+            "fonts keep the input fonts' glyphs.")
+        reset_button.clicked.connect(self._reset_features)
         row.addWidget(all_button)
         row.addWidget(none_button)
+        row.addWidget(reset_button)
         row.addStretch(1)
         box.addLayout(row)
         return section
+
+    def _build_names(self) -> QWidget:
+        """Input and output names of the selected font, in a small table."""
+        panel = QWidget()
+        column = QVBoxLayout(panel)
+        column.setContentsMargins(0, 0, 0, 0)
+        column.addWidget(_label("Input and output names for selected font", "title"))
+        names = QGridLayout()
+        names.setHorizontalSpacing(12)
+        names.setVerticalSpacing(4)
+        names.setColumnStretch(1, 1)
+        names.setColumnStretch(2, 1)
+        for col, text in ((1, "Input"), (2, "Output")):
+            names.addWidget(_label(text, "subtitle"), 0, col)
+        self._name_labels = {}
+        for row, (key, text) in enumerate((("family", "Family"),
+                                           ("full", "Full"),
+                                           ("postscript", "PostScript")), start=1):
+            label = _label(text, "hint")
+            names.addWidget(label, row, 0, Qt.AlignmentFlag.AlignTop)
+            for col, side in ((1, "input"), (2, "output")):
+                value = NameLabel("–")
+                value.setToolTip("Before processing" if side == "input"
+                                 else "After processing")
+                names.addWidget(value, row, col, Qt.AlignmentFlag.AlignTop)
+                self._name_labels[(key, side)] = value
+        column.addLayout(names)
+        return panel
 
     def _build_options(self) -> QWidget:
         """Options column: freezing and reporting at the top, renaming and the
@@ -1524,28 +1976,6 @@ class MainWindow(QMainWindow):
         self.replacenames_edit.setPlaceholderText("search1/replace1,search2/replace2")
         add_field(LABELS["replacenames"], self.replacenames_edit, "replacenames")
         self.info_check = add_check("info")
-        # The selected font's names after processing, in their own small grid
-        # spanning both columns, so the long labels do not widen the label
-        # column above them.
-        names = QGridLayout()
-        names.setHorizontalSpacing(10)
-        names.setVerticalSpacing(4)
-        names.setColumnStretch(1, 1)
-        self.family_name_label = QLabel("–")
-        self.full_name_label = QLabel("–")
-        self.postscript_name_label = QLabel("–")
-        for index, (text, value) in enumerate((
-                ("Family name of selected font", self.family_name_label),
-                ("Full name of selected font", self.full_name_label),
-                ("PostScript name of selected font", self.postscript_name_label))):
-            label = _label(text, "hint")
-            label.setWordWrap(False)
-            value.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
-            value.setToolTip("After processing")
-            names.addWidget(label, index, 0)
-            names.addWidget(value, index, 1)
-        grid.setRowMinimumHeight(grid.rowCount(), 6)
-        grid.addLayout(names, grid.rowCount(), 0, 1, 2)
 
         add_heading(GROUP_FREEZING)
         self.script_combo = QComboBox()
@@ -1589,11 +2019,12 @@ class MainWindow(QMainWindow):
         row.addWidget(QLabel("Size"))
         row.addWidget(self.size_spin)
         box.addLayout(row)
-        self.preview_edit = QTextEdit()
+        self.preview_edit = PreviewEdit()
         self.preview_edit.setAcceptRichText(False)
         self.preview_edit.setPlaceholderText(
             "Add a font to see a preview. You can also type your own text here.")
         self.preview_edit.textChanged.connect(self._refresh_changed_highlight)
+        self.preview_edit.selectionChanged.connect(self.preview_edit.viewport().update)
         box.addWidget(self.preview_edit, 1)
         self.preview_status = _label("", "hint")
         box.addWidget(self.preview_status)
@@ -1687,6 +2118,11 @@ class MainWindow(QMainWindow):
             item.setData(0, Qt.ItemDataRole.UserRole, path)  # the full path
             item.setToolTip(0, path)
             self.font_list.addItem(item)
+            # Features already frozen into the font start ticked, keeping
+            # each glyph as it is until the user changes something.
+            for tag in self._frozen(path) - self._selected_tags:
+                self._selected_tags.add(tag)
+                self._choices["keep"].add(tag)
         self._label_duplicate_names()
         self._fonts_changed()
         self._names_timer.start()
@@ -1708,6 +2144,15 @@ class MainWindow(QMainWindow):
 
     def _show_error(self, title: str, message: str) -> None:
         QMessageBox.critical(self, title, message)
+
+    def _frozen(self, path: str) -> set[str]:
+        """Features already frozen (fully or partly) into a font."""
+        if path not in self._frozen_cache:
+            try:
+                self._frozen_cache[path] = frozen_features(path)
+            except Exception:
+                self._frozen_cache[path] = set()
+        return self._frozen_cache[path]
 
     def _tags(self, path: str) -> frozenset[str]:
         if path not in self._tag_cache:
@@ -1811,7 +2256,7 @@ class MainWindow(QMainWindow):
     def _clear_fonts(self) -> None:
         self.font_list.clear()
         self._selected_tags.clear()
-        self._disabled.clear()
+        self._choices = {"off": {}, "on": {}, "keep": set()}
         self._fonts_changed()
 
     def _choose_output(self) -> None:
@@ -1956,13 +2401,41 @@ class MainWindow(QMainWindow):
             postscript = names.get("postscript", "")
             item.setToolTip(1, f"PostScript name: {postscript}" if postscript else "")
         selected = names_of.get(self._active_font, {})
-        self.family_name_label.setText(selected.get("family") or "–")
-        self.full_name_label.setText(selected.get("full") or "–")
-        self.postscript_name_label.setText(selected.get("postscript") or "–")
+        original = {}
+        if self._active_font:
+            try:
+                original = predict_names(self._active_font, "", "")
+            except Exception:
+                pass
+        for key in ("family", "full", "postscript"):
+            self._name_labels[(key, "input")].setText(original.get(key) or "–")
+            self._name_labels[(key, "output")].setText(selected.get(key) or "–")
+        QTimer.singleShot(0, self._fit_names)
+
+    def eventFilter(self, watched, event) -> bool:  # noqa: N802 (Qt naming)
+        if watched is getattr(self, "_names_panel", None) and \
+                event.type() == QEvent.Type.Resize:
+            QTimer.singleShot(0, self._fit_names)
+        return super().eventFilter(watched, event)
+
+    def _fit_names(self) -> None:
+        """Keep the names panel tall enough for its wrapped lines, and the
+        options below it at full height."""
+        panel = self._names_panel
+        height = panel.layout().totalHeightForWidth(panel.width())
+        if height > 0 and height != panel.minimumHeight():
+            panel.setMinimumHeight(height)
+        options = self._options_panel
+        needed = options.sizeHint().height()
+        if needed != options.minimumHeight():
+            options.setMinimumHeight(needed)
 
     def _feature_toggled(self, checked: bool) -> None:
         tag = self.sender().property("tag")
         (self._selected_tags.add if checked else self._selected_tags.discard)(tag)
+        # Ticked by hand, the whole feature is frozen (except unticked glyphs).
+        self._choices["keep"].discard(tag)
+        self._refresh_subs_buttons()
         self._schedule_preview()
 
     def _update_features_extra(self) -> None:
@@ -1975,6 +2448,7 @@ class MainWindow(QMainWindow):
     def _rebuild_features(self) -> None:
         checked = self._selected_tags
         self._feature_boxes = []
+        self._subs_buttons: dict[str, tuple[QPushButton, dict]] = {}
         container = QWidget()
         grid = QGridLayout(container)
         grid.setAlignment(Qt.AlignmentFlag.AlignTop)
@@ -2008,6 +2482,17 @@ class MainWindow(QMainWindow):
                        "of them to preview it or choose its substitutions.")
             elif pairs:
                 tip = ""
+                frozen = self._font_info.get("frozen", {}).get(tag)
+                if frozen:
+                    count = ("already frozen" if frozen["full"]
+                             else "already partly frozen")
+                    tip = (("This feature was already frozen into this font."
+                            if frozen["full"] else
+                            "Part of this feature was already frozen into "
+                            "this font.")
+                           + " Ticked, the frozen glyphs stay frozen; untick "
+                           "the feature, or glyphs in its substitution list, "
+                           "to give characters their original glyphs back.")
             else:
                 count = "not freezable"
                 tip = ("This feature has no single or alternate substitutions "
@@ -2019,7 +2504,7 @@ class MainWindow(QMainWindow):
                 count += ("  ·  " if count else "") + "not in all fonts"
                 tip += ("\n\n" if tip else "") + "Not in: " + ", ".join(lacking[:10]) + (
                     f" and {len(lacking) - 10} more" if len(lacking) > 10 else "")
-            box = QCheckBox("  ·  ".join(part for part in (tag, name, count) if part))
+            box = ElidingCheckBox("  ·  ".join(part for part in (tag, name, count) if part))
             box.setObjectName("feature")
             box.setProperty("tag", tag)
             box.setChecked(tag in checked)
@@ -2028,11 +2513,15 @@ class MainWindow(QMainWindow):
             # stay tickable.
             box.setEnabled(pairs is None or bool(pairs))
             box.toggled.connect(self._feature_toggled)
+            if tag in self._choices["keep"] and tag in checked:
+                box.setToolTip(tip + ("\n\n" if tip else "") + (
+                    "Ticked because it was already frozen in one of the "
+                    "fonts: each font keeps its frozen glyphs as they are "
+                    "unless you change them."))
             row = QWidget()
             row_layout = QHBoxLayout(row)
             row_layout.setContentsMargins(0, 0, 0, 0)
-            row_layout.addWidget(box)
-            row_layout.addStretch(1)
+            row_layout.addWidget(box, 1)  # shortened to fit; buttons stay right
             if pairs:
                 row_layout.addWidget(self._substitutions_button(tag, name, pairs))
             grid.addWidget(row, index % rows, index // rows)
@@ -2041,41 +2530,88 @@ class MainWindow(QMainWindow):
         self.features_title.setText("OpenType features")
         self._update_features_extra()
 
+    def _encoded(self) -> dict:
+        """{glyph: code points} of the font shown."""
+        info = self._font_info
+        if "encoded" not in info:
+            info["encoded"] = encoded_glyphs(info["cmap"])
+        return info["encoded"]
+
+    def _pair_states(self, tag: str, pairs: dict) -> dict:
+        """{source glyph: True/False/None} for the font shown: whether the
+        substitution will be frozen if the feature is ticked, or None when
+        zapped glyph names hide whether it is frozen (left as it is)."""
+        encoded, zapped = self._encoded(), self._font_info.get("zapped", set())
+        states = {}
+        for source, target in pairs.items():
+            if undeterminable(source, target, encoded, zapped):
+                states[source] = None
+            else:
+                states[source] = pair_wanted(
+                    tag, source, in_effect(source, target, encoded),
+                    {tag}, self._choices)
+        return states
+
     def _substitutions_button(self, tag: str, name: str, pairs: dict) -> QPushButton:
-        total = len(pairs)
-        off = len(self._disabled.get(tag, set()) & set(pairs))
-        unit = "glyph" if total == 1 else "glyphs"
-        button = QPushButton(f"{total - off} of {total} {unit}" if off
-                             else f"{total} {unit}")
+        button = QPushButton()
         button.setObjectName("small")
-        button.setProperty("partial", bool(off))
         button.setToolTip("Show this feature's glyph substitutions and choose "
                           "which ones to freeze")
         button.setAccessibleName(f"{tag} substitutions")
         button.clicked.connect(
             lambda: self._edit_substitutions(tag, name, pairs))
+        self._subs_buttons[tag] = (button, pairs)
+        self._label_subs_button(tag)
         return button
+
+    def _label_subs_button(self, tag: str) -> None:
+        button, pairs = self._subs_buttons[tag]
+        total = len(pairs)
+        on = sum(state is not False for state in self._pair_states(tag, pairs).values())
+        unit = "glyph" if total == 1 else "glyphs"
+        button.setText(f"{on} of {total} {unit}" if on < total else f"{total} {unit}")
+        if button.property("partial") != (on < total):
+            button.setProperty("partial", on < total)
+            button.style().unpolish(button)
+            button.style().polish(button)
+
+    def _refresh_subs_buttons(self) -> None:
+        for tag in getattr(self, "_subs_buttons", {}):
+            self._label_subs_button(tag)
 
     def _edit_substitutions(self, tag: str, name: str, pairs: dict) -> None:
         if not self._active_font:
             return
-        original = set(self._disabled.get(tag, set()))
-        # Keep exclusions of glyphs this font lacks (they may be in other fonts).
-        kept = original - set(pairs)
+        saved = {key: {t: set(g) for t, g in self._choices[key].items()}
+                 for key in ("off", "on")}
+        current = self._pair_states(tag, pairs)
+        # What the user's own choices would give if they had made none.
+        plain = dict(self._choices, off={}, on={})
+        encoded = self._encoded()
+        default_of = {source: pair_wanted(tag, source, in_effect(source, target, encoded),
+                                          {tag}, plain)
+                      for source, target in pairs.items()}
 
-        def apply(disabled: set[str]) -> None:
-            if disabled:
-                self._disabled[tag] = set(disabled)
-            else:
-                self._disabled.pop(tag, None)
+        def apply(states: dict) -> None:
+            off = set(saved["off"].get(tag, set())) - set(states)
+            on = set(saved["on"].get(tag, set())) - set(states)
+            for source, checked in states.items():
+                if checked != default_of[source]:
+                    (on if checked else off).add(source)
+            for key, glyphs in (("off", off), ("on", on)):
+                if glyphs:
+                    self._choices[key][tag] = glyphs
+                else:
+                    self._choices[key].pop(tag, None)
 
         dialog = SubstitutionDialog(
             self, self._active_font, tag, name, pairs, self._font_info["cmap"],
-            original)
+            current, self._font_info.get("zapped", set()),
+            self._font_info.get("frozen", {}).get(tag, {}).get("glyphs", set()))
         # Every tick or untick updates the preview straight away; the feature
         # is previewed even if it is not ticked in the feature list.
-        dialog.changed.connect(lambda disabled: (apply(kept | disabled),
-                                                 self._schedule_preview()))
+        dialog.changed.connect(lambda states: (apply(states),
+                                               self._schedule_preview()))
         self._previewing_tag = tag
         self._place_beside_preview(dialog)
         self._update_preview()
@@ -2083,7 +2619,11 @@ class MainWindow(QMainWindow):
             accepted = dialog.exec() == QDialog.DialogCode.Accepted
         finally:
             self._previewing_tag = None
-        apply(kept | dialog.disabled() if accepted else original)  # Cancel restores
+        if accepted:
+            apply(dialog.states())
+        else:  # Cancel restores
+            for key in ("off", "on"):
+                self._choices[key] = saved[key]
         dialog.deleteLater()
         self._rebuild_features()
         self._update_preview()
@@ -2096,6 +2636,17 @@ class MainWindow(QMainWindow):
         x = max(frame.left() + 16, preview_left - dialog.width() - 24)
         dialog.move(x, frame.top() + 60)
 
+    def _reset_features(self) -> None:
+        """Back to the input fonts' own state: features already frozen into
+        any of them ticked (each glyph kept as it is), nothing else."""
+        frozen = set()
+        for path in self.font_paths():
+            frozen |= self._frozen(path)
+        self._selected_tags = set(frozen)
+        self._choices = {"off": {}, "on": {}, "keep": set(frozen)}
+        self._rebuild_features()
+        self._schedule_preview()
+
     def _set_all_features(self, state: bool) -> None:
         for box in self._feature_boxes:
             box.blockSignals(True)
@@ -2106,6 +2657,8 @@ class MainWindow(QMainWindow):
                 box.property("tag") for box in self._feature_boxes)
         else:
             self._selected_tags.clear()  # including features of other fonts
+        self._choices["keep"].clear()
+        self._refresh_subs_buttons()
         self._update_features_extra()
         self._schedule_preview()
 
@@ -2163,7 +2716,7 @@ class MainWindow(QMainWindow):
                     self._active_font, ",".join(features),
                     pad_tag(self.script_combo.currentText()) or None,
                     pad_tag(self.lang_combo.currentText()) or None,
-                    family, self._disabled)
+                    family, self._choices)
                 font_id = QFontDatabase.addApplicationFontFromData(
                     QByteArray(data))
                 families = QFontDatabase.applicationFontFamilies(font_id)
@@ -2205,8 +2758,8 @@ class MainWindow(QMainWindow):
         count them in the status line."""
         text = self.preview_edit.toPlainText()
         color = QColor(THEMES[self._theme]["changed"])
-        # Collect runs of adjacent changed characters and colour each run as
-        # one range: Qt drops every other one of many back-to-back ranges.
+        # Collect runs of adjacent changed characters; the preview box paints
+        # every glyph in them in the highlight colour.
         runs: list[list[int]] = []  # [start, end) in UTF-16 code units
         present: set[int] = set()
         position = 0  # QTextDocument positions count UTF-16 code units
@@ -2219,16 +2772,9 @@ class MainWindow(QMainWindow):
                 else:
                     runs.append([position, position + size])
             position += size
-        selections = []
-        for start, end in runs:
-            selection = QTextEdit.ExtraSelection()
-            cursor = QTextCursor(self.preview_edit.document())
-            cursor.setPosition(start)
-            cursor.setPosition(end, QTextCursor.MoveMode.KeepAnchor)
-            selection.cursor = cursor
-            selection.format.setForeground(color)
-            selections.append(selection)
-        self.preview_edit.setExtraSelections(selections)
+        self.preview_edit.set_highlight(
+            [tuple(run) for run in runs], color,
+            QColor(THEMES[self._theme]["field"]))
 
         prefix, note = self._status_text
         if note is None:  # an error message
@@ -2309,7 +2855,9 @@ class MainWindow(QMainWindow):
             "report": self.report_check.isChecked(),
             "names": self.names_check.isChecked(),
             "verbose": self.verbose_check.isChecked(),
-            "disabled": {tag: set(glyphs) for tag, glyphs in self._disabled.items()},
+            "choices": {"off": {t: set(g) for t, g in self._choices["off"].items()},
+                        "on": {t: set(g) for t, g in self._choices["on"].items()},
+                        "keep": set(self._choices["keep"])},
         }
 
     def _generate(self) -> None:
@@ -2345,12 +2893,22 @@ class MainWindow(QMainWindow):
         if overwrite:
             self._log("Overwriting the original font files: "
                       + ", ".join(os.path.basename(path) for path in clashes))
-        if not settings["features"]:
+        choices = settings["choices"]
+        frozen = {tag for path in paths for tag in self._frozen(path)}
+        if not settings["features"] and not frozen:
             self._log("Note: no features are selected, so no glyphs will be remapped.")
-        excluded = {tag: glyphs for tag, glyphs in settings["disabled"].items()
-                    if tag in self._selected_tags}
-        for tag, glyphs in sorted(excluded.items()):
-            self._log(f"Excluded from {tag}: " + ", ".join(sorted(glyphs)))
+        for tag in sorted(frozen - self._selected_tags):
+            self._log(f"Reversing {tag}, which was already frozen, in the fonts "
+                      "that have it frozen")
+        for tag in sorted(self._selected_tags):
+            if tag in choices["keep"]:
+                self._log(f"Keeping {tag} as already frozen in each font")
+            if choices["on"].get(tag) and tag in choices["keep"]:
+                self._log(f"Also freezing in {tag}: "
+                          + ", ".join(sorted(choices["on"][tag])))
+            if choices["off"].get(tag):
+                self._log(f"Not frozen in {tag} (reversed where already frozen): "
+                          + ", ".join(sorted(choices["off"][tag])))
         if (settings["info"] and not settings["suffix"]
                 and not settings["replacenames"]):
             self._log("Note: the version string is only updated when a suffix "
