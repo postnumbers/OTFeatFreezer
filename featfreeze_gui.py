@@ -93,7 +93,7 @@ HELP = {
               "will be constructed from the OpenType feature tags)",
     "usesuffix": "use a custom suffix when --suffix is enabled",
     "replacenames": "search for strings in the font naming tables and replace "
-                    "them, format is 'search1/replace1,search2/replace2,...'",
+                    "or remove them, format is 'search1/replace1,word,...'",
     "info": "update font version string",
     "report": "report languages, scripts and features in font",
     "names": "output names of remapped glyphs during processing",
@@ -125,13 +125,17 @@ POPUP = {
     "replacenames": "Rename the font family and its styles by replacing "
                     "text in their names, e.g. Inter/Outer renames the Inter "
                     "family to Outer, and Bold/Heavy renames the Bold style to "
-                    "Heavy. Each pair is applied to both the family name and "
+                    "Heavy. To remove words, enter them without a slash: "
+                    "OT 2 turns Hermes Maia OT 2 into Hermes Maia, and Thin "
+                    "turns the Thin Italic style into Italic. Words are removed "
+                    "whole, so Thin leaves Thinner alone. "
+                    "Each pair is applied to both the family name and "
                     "the style name; the search is case-sensitive. The full "
                     "name, PostScript name and output file name follow the new "
                     "names. The basic style name used for style linking "
                     "(Regular, Italic, Bold, Bold Italic) is kept; the new "
                     "style name is stored as the typographic style name. "
-                    "Format: search1/replace1,search2/replace2,...",
+                    "Format: search1/replace1,search2/replace2,word,...",
     "info": "Update the font version string by appending '; featfreeze: "
             "<features>'. Only takes effect together with a suffix or "
             "replace names.",
@@ -638,6 +642,224 @@ def main_characters(codepoints, ligatures: dict | None = None,
     return "\n".join(text for _, text in lines)
 
 
+# ---- sample texts for the preview ---------------------------------------- #
+
+def western_characters(codepoints, ligatures: dict | None = None) -> str:
+    """main_characters() limited to the Western and Central European
+    character sets (Basic Latin, Latin-1, Latin Extended-A and the few others
+    in Windows-1252 and its neighbours) with common punctuation and symbols."""
+    def western(cp: int) -> bool:
+        return (cp < 0x180                       # Basic Latin to Latin Extended-A
+                or cp in WESTERN_EXTRAS
+                or 0x2000 <= cp < 0x2090         # punctuation, super/subscript figures
+                or 0x20A0 <= cp < 0x20D0         # currency
+                or 0x2153 <= cp < 0x215F)        # fractions
+    return main_characters([cp for cp in codepoints if western(cp)], ligatures,
+                           limit=10_000)
+
+
+# ƒ, Romanian Ș ș Ț ț, ẞ, the spacing accents of Windows-1252, and ℓ № ™ Ω ℮.
+WESTERN_EXTRAS = frozenset((0x192, 0x218, 0x219, 0x21A, 0x21B, 0x1E9E,
+                            0x2C6, 0x2C7, 0x2D8, 0x2D9, 0x2DA, 0x2DB, 0x2DC, 0x2DD,
+                            0x2113, 0x2116, 0x2122, 0x2126, 0x212E))
+
+
+PROSE_SAMPLE = """\
+The Quick Brown Fox Jumps Over the Lazy Dog
+Sphinx of black quartz, judge my vow! Pack my box with five dozen liquor jugs.
+
+At 7:45 on a grey Tuesday in March, the ferry left Halifax with 213 passengers, \
+two “mostly harmless” goats and a crate of 1,860 apples. Nobody aboard \
+expected the fog — thick, quiet, and oddly fragrant — to linger past noon. \
+By half past four the captain’s logbook read: “Visibility 0.5 km; spirits \
+high; goats unimpressed.” The first officer, who had sailed these waters for \
+nineteen years, simply shrugged and poured another coffee (black, no sugar).
+
+Typography is the craft of making language visible. A well-set paragraph \
+invites the eye to move effortlessly from word to word, line to line; a \
+poorly set one makes even a fine sentence feel like work. Figures such as \
+0123456789, fractions like ½ and ¾, prices of $49.99, €35 or £12, and \
+percentages of 15% all deserve the same care as the letters around them.
+
+Français : « Où est le café ? » demanda Zoé, déçue que l’hôtel fût fermé.
+Deutsch: Größere Übungen fördern schöne Ergebnisse — täglich, natürlich.
+Español: ¿Dónde está el niño? ¡Mañana pediremos jalapeños y piñas!
+Português: A ação de graças começou às três, não às duas, irmão.
+Polski: Zażółć gęślą jaźń; łódź płynie po jeziorze.
+Čeština: Příliš žluťoučký kůň úpěl ďábelské ódy.
+Dansk/Norsk/Svenska: Blåbærsyltetøy, smørbrød og åtte små äpplen.
+"""
+
+SAMPLE_LANGUAGES = ("JavaScript", "HTML", "CSS", "Java", "PHP", "Python", "Markdown")
+
+CODE_SAMPLES = {
+    "JavaScript": """\
+// Fetch a list of fonts and keep the ones with a given feature.
+const API = "https://example.com/api/fonts";
+
+async function fontsWith(feature = "ss01") {
+  const response = await fetch(`${API}?limit=50`);
+  if (!response.ok) throw new Error(`HTTP ${response.status}`);
+  const fonts = await response.json();
+  return fonts
+    .filter((font) => font.features?.includes(feature))
+    .map(({ family, weight = 400 }) => ({ family, weight }));
+}
+
+fontsWith("cv11").then((list) => {
+  for (const { family, weight } of list) {
+    console.log(family, weight >= 700 ? "bold" : "regular");
+  }
+}).catch((error) => console.error(error.message ?? error));
+""",
+    "HTML": """\
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Specimen &mdash; Frozen Features</title>
+  <link rel="stylesheet" href="specimen.css">
+</head>
+<body>
+  <!-- A simple type specimen -->
+  <header class="hero">
+    <h1>Aa Gg 0123456789</h1>
+    <p>Stylistic sets &amp; character variants, frozen in.</p>
+  </header>
+  <ul id="weights">
+    <li data-weight="400">Regular</li>
+    <li data-weight="700"><strong>Bold</strong></li>
+  </ul>
+  <a href="#top" title="Back to top">&uarr; Top</a>
+</body>
+</html>
+""",
+    "CSS": """\
+/* Specimen styles */
+:root {
+  --ink: #1e1e20;
+  --paper: hsl(40 30% 97%);
+  --measure: 66ch;
+}
+
+body {
+  font: 400 1.125rem/1.6 "Inter", system-ui, sans-serif;
+  font-feature-settings: "ss01" 1, "cv11" 1, "tnum";
+  color: var(--ink);
+  background: var(--paper);
+  max-width: var(--measure);
+  margin: 0 auto;
+}
+
+.hero h1:not(:empty)::after {
+  content: " \\2192";
+  letter-spacing: -0.02em;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root { --ink: #ececee; --paper: #202024; }
+}
+""",
+    "Java": """\
+package ca.example.fonts;
+
+import java.util.List;
+import java.util.Map;
+import java.util.stream.Collectors;
+
+/** Groups font files by family name. */
+public final class FontIndex {
+    private static final int MAX_FILES = 1_000;
+
+    public record Font(String family, String style, int weight) {}
+
+    public static Map<String, List<Font>> byFamily(List<Font> fonts) {
+        if (fonts == null || fonts.size() > MAX_FILES) {
+            throw new IllegalArgumentException("0 < files <= " + MAX_FILES);
+        }
+        return fonts.stream()
+                .filter(f -> f.weight() >= 100 && f.weight() <= 900)
+                .collect(Collectors.groupingBy(Font::family));
+    }
+}
+""",
+    "PHP": """\
+<?php
+declare(strict_types=1);
+
+// List the fonts in a folder, newest first.
+function listFonts(string $folder, array $types = ['otf', 'ttf']): array
+{
+    $fonts = [];
+    foreach (glob($folder . '/*.*') ?: [] as $path) {
+        $type = strtolower(pathinfo($path, PATHINFO_EXTENSION));
+        if (in_array($type, $types, true)) {
+            $fonts[$path] = filemtime($path);
+        }
+    }
+    arsort($fonts);
+    return array_keys($fonts);
+}
+
+$count = count(listFonts(__DIR__ . '/fonts'));
+echo "Found {$count} font" . ($count !== 1 ? 's' : '') . PHP_EOL;
+""",
+    "Python": """\
+from pathlib import Path
+from fontTools.ttLib import TTFont
+
+
+def features(path: Path) -> list[str]:
+    \"\"\"The GSUB feature tags of a font, sorted and without repeats.\"\"\"
+    with TTFont(path, lazy=True) as font:
+        if "GSUB" not in font:
+            return []
+        records = font["GSUB"].table.FeatureList.FeatureRecord
+        return sorted({record.FeatureTag for record in records})
+
+
+if __name__ == "__main__":
+    for path in sorted(Path("~/Library/Fonts").expanduser().glob("*.otf")):
+        tags = features(path)
+        print(f"{path.name:<40} {len(tags):>3} -> {', '.join(tags[:5])}")
+""",
+    "Markdown": """\
+# Freezing OpenType features
+
+Some apps **ignore** OpenType features, so stylistic sets such as `ss01`
+never show up. *Freezing* makes them the default.
+
+## Steps
+
+1. Add the fonts.
+2. Tick the features to freeze — e.g. `cv11` (single-storey a).
+3. Click **Generate output font files**.
+
+> Tip: keep the originals; frozen fonts are best given a new name.
+
+| Feature | Effect            |
+|---------|-------------------|
+| `tnum`  | Tabular figures   |
+| `zero`  | Slashed zero      |
+
+```bash
+pyftfeatfreeze -f ss01,zero Inter.otf Inter-Frozen.otf
+```
+
+See [the freezer](https://github.com/twardoch/fonttools-opentype-feature-freezer).
+""",
+}
+
+# Preview samples: key -> menu label (code samples sit in a submenu).
+SAMPLE_NAMES = {
+    "western": "Western character sets",
+    "all": "All characters in the font",
+    "prose": "Prose",
+    **{f"code:{language}": f"Code: {language}" for language in SAMPLE_LANGUAGES},
+    "custom": "Custom text",
+}
+
+
 def make_options(**overrides) -> SimpleNamespace:
     options = dict(
         inpath=None, outpath=None, features="", script=None, lang=None,
@@ -673,15 +895,42 @@ def unique_path(folder: str, filename: str, taken: set[str]) -> str:
 
 
 def parse_pairs(replacenames: str) -> list[tuple[str, str]]:
-    """'Inter/Outer,Bold/Heavy' -> [('Inter', 'Outer'), ('Bold', 'Heavy')].
-    Pairs without exactly one '/' or with nothing to search for are skipped."""
+    """'Inter/Outer,Bold/Heavy,OT 2' -> [('Inter', 'Outer'), ('Bold', 'Heavy'),
+    ('OT 2', '')]. A term without '/' (or with nothing after it) is removed.
+    Items with more than one '/' or with nothing to search for are skipped."""
     pairs = []
     for pair in replacenames.split(",") if replacenames else ():
-        if pair.count("/") == 1:
-            search, replace = pair.split("/")
-            if search:
-                pairs.append((search, replace))
+        if pair.count("/") > 1:
+            continue
+        search, _, replace = pair.partition("/")
+        if search.strip():
+            pairs.append((search, replace))
     return pairs
+
+
+def valid_replacenames(replacenames: str) -> bool:
+    """True when every comma-separated item is 'search/replace' or a term."""
+    return all(item.count("/") <= 1 for item in replacenames.split(","))
+
+
+def remove_term(text: str, term: str, compact: bool = False) -> str:
+    """Remove `term` from `text` as whole words: 'Thin' goes from 'Hermes
+    Thin Italic' but 'Thinner' is kept. Words in `term` may be separated by
+    any spaces. With `compact`, also remove it with its spaces dropped, as in
+    PostScript and file names ('OT 2' from 'HermesMaiaOT2-Thin'), where a word
+    ends where the next capital, digit or '-' starts."""
+    words = term.split()
+    if not words:
+        return text
+    spaced = r"\s+".join(map(re.escape, words))
+    text = re.sub(rf"(?<![^\s-]){spaced}(?![^\s-])", "", text)
+    if compact:
+        # 'OT 2' as 'OT2', and as 'OT-2' for names hyphenated between words.
+        for short in dict.fromkeys(["".join(words), "-".join(words)]):
+            lead = "" if short[0].isupper() else r"(?<![A-Za-z0-9])"
+            trail = r"(?![a-z0-9])" if short[-1].isdigit() else r"(?![a-z])"
+            text = re.sub(rf"{lead}{re.escape(short)}{trail}", "", text)
+    return text
 
 
 def apply_pairs(text: str, pairs: list[tuple[str, str]], compact: bool = False) -> str:
@@ -689,14 +938,34 @@ def apply_pairs(text: str, pairs: list[tuple[str, str]], compact: bool = False) 
 
     With `compact`, each pair is also applied with its spaces removed, for
     PostScript and file names, which have no spaces ('Semi Bold/Demi' also
-    turns 'SemiBold' into 'Demi')."""
+    turns 'SemiBold' into 'Demi').
+
+    Spaces around a search term are forgiving: if 'OT 2 ' is not found (as
+    at the end of 'Hermes Maia OT 2'), 'OT 2' is tried instead. Runs of
+    spaces left behind by a replacement are collapsed to one."""
+    original = text
     for search, replace in pairs:
-        text = text.replace(search, replace)
+        if not replace:
+            text = remove_term(text, search, compact)
+            continue
+        trimmed = search.strip()
+        if search in text:
+            text = text.replace(search, replace)
+        elif trimmed and trimmed != search and trimmed in text:
+            text = text.replace(trimmed, replace.strip())
         if compact:
             short = search.replace(" ", "")
             if short and short != search:
                 text = text.replace(short, replace.replace(" ", ""))
+    if text != original:
+        text = re.sub(r" {2,}", " ", text)
+        text = re.sub(r"-{2,}", "-", text)
     return text
+
+
+def rename_family(family: str, pairs: list[tuple[str, str]]) -> str:
+    """The family name with the replace names pairs applied, trimmed."""
+    return apply_pairs(family, pairs).strip() or family
 
 
 def replace_in_filename(stem: str, replacenames: str) -> str:
@@ -715,14 +984,45 @@ def rename_style(full: str, postscript: str, family: str,
     the family 'Inter') and of a PostScript name (after the '-'), leaving the
     family part alone, since the family is renamed separately."""
     if family and full.startswith(family):
-        full = family + apply_pairs(full[len(family):], pairs)
-    if "-" in postscript:
-        head, tail = postscript.split("-", 1)
-        postscript = f"{head}-{apply_pairs(tail, pairs, compact=True)}"
+        full = (family + apply_pairs(full[len(family):], pairs)).rstrip()
+    # Removals also go through the family part of the PostScript name, in
+    # case it doesn't spell the family exactly as the family name does
+    # ('HermesMaiaOTTwo' for 'Hermes Maia OT Two' is caught by 'OT Two', and
+    # 'OTTwo' can be given as a term too). Replacements are not, since the
+    # library has already applied them there.
+    # Removals run over the whole PostScript name, so a term is found even
+    # where the name is hyphenated differently ('HermesMaiaOT-2-Thin').
+    removals = [(search, "") for search, replace in pairs if not replace]
+    replacements = [(search, replace) for search, replace in pairs if replace]
+    if postscript:
+        had_style = "-" in postscript
+        stripped = apply_pairs(postscript, removals, compact=True).strip("-")
+        if not stripped or stripped.startswith(("-",)):
+            stripped = postscript
+        head, _, tail = stripped.partition("-")
+        tail = apply_pairs(tail, replacements, compact=True).strip("-")
+        # A style the pairs removed entirely ('Regular' from
+        # 'Inter-Regular') leaves just the family: 'Inter'.
+        postscript = f"{head}-{tail}" if had_style and tail else head
     return full, postscript
 
 
-def rename_styles(font: TTFont, replacenames: str) -> None:
+def postscript_from_names(family: str, full: str, style: str) -> str:
+    """A standard 'Family-Style' PostScript name, at most 63 characters, with
+    spaces and characters PostScript names can't hold removed. The style is
+    the part of the full name after the family; when the full name is just
+    the family ('Hermes Maia 2 Caps'), `style` is used instead. With no style
+    at all, the PostScript name is the family alone. Hyphens typed into the
+    family are kept ('Hermes Maia-2 Caps' -> 'HermesMaia-2Caps-Regular')."""
+    def clean(text: str) -> str:
+        return re.sub(r"[^!-~]|[\[\](){}<>/%]", "", text)
+    tail = full[len(family):].strip() if family and full.startswith(family) else ""
+    tail = clean(tail or style)
+    return (f"{clean(family)}-{tail}" if tail else clean(family))[:63]
+
+
+def rename_styles(font: TTFont, replacenames: str,
+                  original_postscript: str | None = None) -> None:
     """Apply the replace names pairs to the style names too, after
     RemapByOTL.renameFont() has renamed the family.
 
@@ -738,11 +1038,17 @@ def rename_styles(font: TTFont, replacenames: str) -> None:
         return
     name = font["name"]
     family = name.getDebugName(16) or name.getDebugName(1) or ""
+    if original_postscript is None:
+        original_postscript = name.getDebugName(6) or ""
+    # The style as renamed, empty if the pairs removed all of it (unlike the
+    # style name records below, which fall back to Regular).
+    postscript_style = apply_pairs(
+        name.getDebugName(17) or name.getDebugName(2) or "", pairs).strip()
     changed = False
     for record in name.names:
         text = record.toStr()
         if record.nameID == 17:
-            new = apply_pairs(text, pairs)
+            new = apply_pairs(text, pairs).strip() or "Regular"
         elif record.nameID in (1, 4):
             new = rename_style(text, "", family, pairs)[0]
         elif record.nameID in (6, 20):
@@ -756,7 +1062,7 @@ def rename_styles(font: TTFont, replacenames: str) -> None:
     if name.getDebugName(17) is None:
         for record in [r for r in name.names if r.nameID == 2]:
             style = record.toStr()
-            new_style = apply_pairs(style, pairs)
+            new_style = apply_pairs(style, pairs).strip() or "Regular"
             if new_style == style:
                 continue
             where = (record.platformID, record.platEncID, record.langID)
@@ -765,6 +1071,20 @@ def rename_styles(font: TTFont, replacenames: str) -> None:
                 name.setName(legacy.toStr() if legacy else family, 16, *where)
             name.setName(new_style, 17, *where)
             changed = True
+
+    # A PostScript name without a hyphen ('HermesMaiaOT2ThinItalic') can't be
+    # split into family and style, so the pairs can't be applied to its style
+    # part. Rebuild it from the renamed family and full names instead. This
+    # goes by the original name: a hyphen the renaming put into the family
+    # ('HermesMaia-2Caps…') is not a family/style separator.
+    if original_postscript and "-" not in original_postscript:
+        new = postscript_from_names(
+            name.getDebugName(16) or name.getDebugName(1) or "",
+            name.getDebugName(4) or "", postscript_style)
+        for record in name.names:
+            if record.nameID == 6 and record.toStr() != new:
+                record.string = new
+                changed = True
 
     if changed and "CFF " in font:
         cff = font["CFF "].cff
@@ -949,6 +1269,79 @@ def output_target(folder: str, filename: str, inpath: str, taken: set[str],
     return target
 
 
+def library_family_rename(remapper, replacenames: str) -> None:
+    """Run RemapByOTL.renameFont() with the family renamed our way.
+
+    The library applies each pair to the family name with a plain
+    str.replace, so 'OT 2 /' never matches 'Hermes Maia OT 2' (no trailing
+    space) and ' OT 2/' can't be typed because the field is trimmed. Work out
+    the new family with rename_family() and give the library just the one
+    exact pair 'old family/new family'; the style parts, file names and other
+    records are handled by rename_styles() and output_filename()."""
+    name = remapper.ttx["name"]
+    record = name.getName(16, 3, 1) or name.getName(1, 3, 1)
+    old_family = record.toStr() if record is not None else ""
+    new_family = rename_family(old_family, parse_pairs(replacenames))
+    exact = ""
+    if new_family != old_family and not any(c in old_family + new_family for c in "/,"):
+        exact = f"{old_family}/{new_family}"
+    original = remapper.options
+    remapper.options = SimpleNamespace(**{**vars(original), "replacenames": exact})
+    try:
+        remapper.renameFont()
+    finally:
+        remapper.options = original
+
+
+def rename_font(remapper, options: SimpleNamespace) -> str:
+    """Rename the font in `remapper.ttx` as the suffix and replace names
+    options say, and return its output file name. Used both when saving and
+    for the names shown before saving, so the two always agree."""
+    names = remapper.ttx["name"]
+    old_family = names.getDebugName(16) or names.getDebugName(1) or ""
+    old_postscript = names.getDebugName(6) or ""
+    library_family_rename(remapper, options.replacenames)
+    rename_styles(remapper.ttx, options.replacenames, old_postscript)
+    renamed = bool(options.suffix or options.replacenames)
+    if renamed:
+        # The library leaves the unique ID (name ID 3) on the old names;
+        # bring it in line with the new family and PostScript names.
+        new_family = names.getDebugName(16) or names.getDebugName(1) or ""
+        new_postscript = names.getDebugName(6) or ""
+        for record in names.names:
+            if record.nameID != 3:
+                continue
+            text = record.toStr()
+            if old_postscript and new_postscript:
+                text = text.replace(old_postscript, new_postscript)
+            if old_family and new_family:
+                text = text.replace(old_family, new_family)
+                text = text.replace(old_family.replace(" ", ""),
+                                    new_family.replace(" ", ""))
+            record.string = text
+    if renamed and "fvar" in remapper.ttx:
+        return variable_filename(
+            options.inpath, old_family,
+            names.getDebugName(16) or names.getDebugName(1) or "",
+            options.replacenames)
+    return output_filename(remapper.ttx, options.inpath, renamed,
+                           options.replacenames)
+
+
+def font_names(font: TTFont) -> dict:
+    """The family, style, full and PostScript names of a font, preferring the
+    Windows English records and the typographic family and style."""
+    name = font["name"]
+
+    def get(name_id: int) -> str:
+        record = name.getName(name_id, 3, 1, 0x409) or name.getName(name_id, 3, 1)
+        return record.toStr() if record is not None else (
+            name.getDebugName(name_id) or "")
+
+    return {"family": get(16) or get(1), "style": get(17) or get(2),
+            "full": get(4), "postscript": get(6)}
+
+
 def freeze_font(options: SimpleNamespace, folder: str, taken: set[str],
                 choices: dict | None = None, overwrite: bool = False) -> str | None:
     """Freeze one font into `folder`. Returns the saved path, or None on failure."""
@@ -958,37 +1351,7 @@ def freeze_font(options: SimpleNamespace, folder: str, taken: set[str],
         return None
     try:
         remap_glyphs(remapper, choices)
-        names = remapper.ttx["name"]
-        old_family = names.getDebugName(16) or names.getDebugName(1) or ""
-        old_postscript = names.getDebugName(6) or ""
-        remapper.renameFont()
-        rename_styles(remapper.ttx, options.replacenames)
-        renamed = bool(options.suffix or options.replacenames)
-        if renamed:
-            # The library leaves the unique ID (name ID 3) on the old names;
-            # bring it in line with the new family and PostScript names.
-            new_family = names.getDebugName(16) or names.getDebugName(1) or ""
-            new_postscript = names.getDebugName(6) or ""
-            for record in names.names:
-                if record.nameID != 3:
-                    continue
-                text = record.toStr()
-                if old_postscript and new_postscript:
-                    text = text.replace(old_postscript, new_postscript)
-                if old_family and new_family:
-                    text = text.replace(old_family, new_family)
-                    text = text.replace(old_family.replace(" ", ""),
-                                        new_family.replace(" ", ""))
-                record.string = text
-        if renamed and "fvar" in remapper.ttx:
-            names = remapper.ttx["name"]
-            filename = variable_filename(
-                options.inpath, old_family,
-                names.getDebugName(16) or names.getDebugName(1) or "",
-                options.replacenames)
-        else:
-            filename = output_filename(remapper.ttx, options.inpath, renamed,
-                                       options.replacenames)
+        filename = rename_font(remapper, options)
         target = output_target(folder, filename, options.inpath, taken, overwrite)
         replacing = os.path.realpath(target) == os.path.realpath(options.inpath)
         # The input is still being read, so never write over it directly:
@@ -1010,44 +1373,23 @@ def freeze_font(options: SimpleNamespace, folder: str, taken: set[str],
 def predict_names(path: str, suffix: str, replacenames: str) -> dict:
     """The names a font will get, without freezing anything.
 
-    Mirrors RemapByOTL.renameFont() on the name table. Returns a dict with
-    'filename', 'family', 'full' (family plus style) and 'postscript'.
+    Runs the same renaming as saving does (rename_font) on the font in
+    memory. Returns a dict with 'filename', 'family', 'style', 'full' and
+    'postscript'.
     """
     font = TTFont(path, lazy=True)
     try:
-        name = font["name"]
-
-        def get(name_id: int) -> str:
-            record = name.getName(name_id, 3, 1)
-            return record.toStr() if record is not None else (
-                name.getDebugName(name_id) or "")
-
-        family = old_family = get(16) or get(1)
-        full, postscript = get(4), get(6)
         if not suffix and not replacenames:
-            return {"filename": os.path.basename(path), "family": family,
-                    "full": full, "postscript": postscript}
+            return {"filename": os.path.basename(path), **font_names(font)}
+        name = font["name"]
         if name.getName(16, 3, 1) is None and name.getName(1, 3, 1) is None:
             raise ValueError("no Windows family name to rename")
-        for search, replace in (pair.split("/") for pair in replacenames.split(",")
-                                if replacenames):
-            family = family.replace(search, replace)
-        new_family = f"{family} {suffix}" if suffix else family
-        full = full.replace(old_family, new_family)
-        postscript = postscript.replace(old_family.replace(" ", ""),
-                                        new_family.replace(" ", ""))
-        # The style part too, as rename_styles() does when saving.
-        full, postscript = rename_style(full, postscript, new_family,
-                                        parse_pairs(replacenames))
-        if "fvar" in font:  # variable fonts: no style name in the file name
-            return {"filename": variable_filename(path, old_family, new_family,
-                                                  replacenames),
-                    "family": new_family, "full": full, "postscript": postscript}
-        stem = re.sub(r'[\\/:*?"<>|\x00-\x1f]', "", postscript).strip()
-        if not stem:
-            stem = replace_in_filename(Path(path).stem, replacenames)
-        return {"filename": f"{stem or Path(path).stem}{Path(path).suffix}",
-                "family": new_family, "full": full, "postscript": postscript}
+        options = make_options(inpath=path, suffix=bool(suffix),
+                               usesuffix=suffix, replacenames=replacenames)
+        remapper = RemapByOTL(options)
+        remapper.ttx = font
+        filename = rename_font(remapper, options)
+        return {"filename": filename, **font_names(font)}
     finally:
         font.close()
 
@@ -1714,6 +2056,8 @@ class MainWindow(QMainWindow):
         self._last_font_folder = ""                # where "Add fonts…" last looked
         self._status_text = ("", "")               # preview status: before / after count
         self._auto_preview_text = ""           # last preview text the app filled in
+        self._filling_preview = False          # True while the app sets the text
+        self._auto_output = ""                 # output folder filled in by the app
         self._feature_boxes: list[QCheckBox] = []
         self._changed: set[int] = set()
         self._preview_font_id = -1
@@ -1738,6 +2082,11 @@ class MainWindow(QMainWindow):
         override = self._settings.value("theme_override", "")
         self._theme_override = override if override in THEMES else ""
         self._theme = self._theme_override or system_theme(app)
+        # The preview's sample text, and the user's own text, kept across
+        # launches; the custom text starts empty.
+        sample = self._settings.value("sample", "western")
+        self._sample = sample if sample in SAMPLE_NAMES else "western"
+        self._custom_text = str(self._settings.value("custom_text", "") or "")
         try:
             app.styleHints().colorSchemeChanged.connect(self._system_theme_changed)
         except AttributeError:  # Qt older than 6.5
@@ -1808,6 +2157,7 @@ class MainWindow(QMainWindow):
         self._set_theme(self._theme)
         self._update_file_count()
         self._rebuild_features()
+        self._show_sample()
 
     # ---- construction ---------------------------------------------------- #
 
@@ -1914,6 +2264,7 @@ class MainWindow(QMainWindow):
             names.addWidget(_label(text, "subtitle"), 0, col)
         self._name_labels = {}
         for row, (key, text) in enumerate((("family", "Family"),
+                                           ("style", "Style"),
                                            ("full", "Full"),
                                            ("postscript", "PostScript")), start=1):
             label = _label(text, "hint")
@@ -1973,7 +2324,7 @@ class MainWindow(QMainWindow):
         self.suffix_edit.setPlaceholderText("e.g. SC (empty: no suffix)")
         add_field(LABELS["usesuffix"], self.suffix_edit, "usesuffix")
         self.replacenames_edit = QLineEdit()
-        self.replacenames_edit.setPlaceholderText("search1/replace1,search2/replace2")
+        self.replacenames_edit.setPlaceholderText("search/replace, or a word to remove")
         add_field(LABELS["replacenames"], self.replacenames_edit, "replacenames")
         self.info_check = add_check("info")
 
@@ -2001,7 +2352,7 @@ class MainWindow(QMainWindow):
         splitter = QSplitter(Qt.Orientation.Vertical)
         splitter.setHandleWidth(14)
 
-        section, box, _ = _section("Preview")
+        section, box, preview_title = _section("Preview")
         row = QHBoxLayout()
         self._hide_unchanged = False
         self.unchanged_button = QPushButton("Hide unchanged characters")
@@ -2009,21 +2360,46 @@ class MainWindow(QMainWindow):
             "Switch between the main characters of the selected font and only "
             "the characters the selected features change.")
         self.unchanged_button.clicked.connect(self._toggle_unchanged)
+        self.sample_button = QPushButton()
+        self.sample_button.setToolTip("Choose the sample text shown in the preview")
+        menu = QMenu(self.sample_button)
+        code_menu = None
+        for key, label in SAMPLE_NAMES.items():
+            if key.startswith("code:"):
+                if code_menu is None:
+                    code_menu = menu.addMenu("Code")
+                target = code_menu
+            else:
+                if key == "custom":
+                    menu.addSeparator()
+                target = menu
+            action = target.addAction(label.removeprefix("Code: "))
+            action.triggered.connect(lambda _=False, k=key: self._choose_sample(k))
+        self.sample_button.setMenu(menu)
+        self._label_sample_button()
         self.size_spin = QSpinBox()
         self.size_spin.setRange(8, 200)
         self.size_spin.setValue(32)
         self.size_spin.setSuffix(" pt")
         self.size_spin.valueChanged.connect(self._apply_preview_font)
+        # The size sits on the title line, leaving the row below to the buttons.
+        box.removeWidget(preview_title)
+        title_row = QHBoxLayout()
+        title_row.addWidget(preview_title)
+        title_row.addStretch(1)
+        title_row.addWidget(QLabel("Size"))
+        title_row.addWidget(self.size_spin)
+        box.addLayout(title_row)
         row.addWidget(self.unchanged_button)
+        row.addWidget(self.sample_button)
         row.addStretch(1)
-        row.addWidget(QLabel("Size"))
-        row.addWidget(self.size_spin)
         box.addLayout(row)
         self.preview_edit = PreviewEdit()
         self.preview_edit.setAcceptRichText(False)
         self.preview_edit.setPlaceholderText(
             "Add a font to see a preview. You can also type your own text here.")
         self.preview_edit.textChanged.connect(self._refresh_changed_highlight)
+        self.preview_edit.textChanged.connect(self._keep_custom_text)
         self.preview_edit.selectionChanged.connect(self.preview_edit.viewport().update)
         box.addWidget(self.preview_edit, 1)
         self.preview_status = _label("", "hint")
@@ -2124,6 +2500,7 @@ class MainWindow(QMainWindow):
                 self._selected_tags.add(tag)
                 self._choices["keep"].add(tag)
         self._label_duplicate_names()
+        self._follow_first_font_folder()
         self._fonts_changed()
         self._names_timer.start()
         return True
@@ -2250,6 +2627,7 @@ class MainWindow(QMainWindow):
         for item in self.font_list.selectedItems():
             self.font_list.takeItem(self.font_list.row(item))
         self._label_duplicate_names()
+        self._follow_first_font_folder()
         self._names_timer.start()
         self._fonts_changed()
 
@@ -2257,7 +2635,18 @@ class MainWindow(QMainWindow):
         self.font_list.clear()
         self._selected_tags.clear()
         self._choices = {"off": {}, "on": {}, "keep": set()}
+        self._follow_first_font_folder()
         self._fonts_changed()
+
+    def _follow_first_font_folder(self) -> None:
+        """Until the user picks an output folder, use the first font's folder."""
+        current = self.output_edit.text().strip()
+        if current not in ("", self._auto_output):
+            return  # chosen or typed by the user
+        paths = self.font_paths()
+        folder = os.path.dirname(paths[0]) if paths else ""
+        self._auto_output = folder
+        self.output_edit.setText(folder)
 
     def _choose_output(self) -> None:
         folder = QFileDialog.getExistingDirectory(
@@ -2300,7 +2689,7 @@ class MainWindow(QMainWindow):
         # Keep text the user typed; only replace text the app filled in itself.
         if (self.preview_edit.toPlainText() in ("", self._auto_preview_text)
                 and not self._hide_unchanged):
-            self._show_main_characters()
+            self._show_sample()
         self._update_preview()
 
     # ---- features, scripts, languages ------------------------------------ #
@@ -2315,7 +2704,7 @@ class MainWindow(QMainWindow):
         """(custom suffix, replace names) as used for renaming, or None if
         replace names is not valid."""
         replacenames = self.replacenames_edit.text().strip()
-        if replacenames and any(p.count("/") != 1 for p in replacenames.split(",")):
+        if replacenames and not valid_replacenames(replacenames):
             return None
         return self.suffix_edit.text().strip(), replacenames
 
@@ -2407,7 +2796,7 @@ class MainWindow(QMainWindow):
                 original = predict_names(self._active_font, "", "")
             except Exception:
                 pass
-        for key in ("family", "full", "postscript"):
+        for key in ("family", "style", "full", "postscript"):
             self._name_labels[(key, "input")].setText(original.get(key) or "–")
             self._name_labels[(key, "output")].setText(selected.get(key) or "–")
         QTimer.singleShot(0, self._fit_names)
@@ -2788,15 +3177,67 @@ class MainWindow(QMainWindow):
 
     def _fill_preview(self, text: str) -> None:
         self._auto_preview_text = text
-        self.preview_edit.setPlainText(text)
+        self._filling_preview = True
+        try:
+            self.preview_edit.setPlainText(text)
+        finally:
+            self._filling_preview = False
 
-    def _show_main_characters(self) -> None:
-        self.preview_edit.setPlaceholderText(
-            "Add a font to see a preview. You can also type your own text here.")
-        self._fill_preview(main_characters(
-            self._font_info["cmap"], self._font_info["ligatures"]))
+    def _sample_text(self) -> str:
+        info = self._font_info
+        if self._sample == "western":
+            return western_characters(info["cmap"], info["ligatures"])
+        if self._sample == "all":
+            return main_characters(info["cmap"], info["ligatures"])
+        if self._sample == "prose":
+            return PROSE_SAMPLE
+        if self._sample == "custom":
+            return self._custom_text
+        return CODE_SAMPLES[self._sample.removeprefix("code:")].rstrip("\n")
+
+    def _show_sample(self) -> None:
+        # Code keeps its lines (scroll sideways); other samples wrap.
+        self.preview_edit.setLineWrapMode(
+            QTextEdit.LineWrapMode.NoWrap if self._sample.startswith("code:")
+            else QTextEdit.LineWrapMode.WidgetWidth)
+        if self._sample == "custom":
+            placeholder = ("Type your own sample text here. It is kept, even "
+                           "after quitting, until you change it.")
+        else:
+            placeholder = ("Add a font to see a preview. You can also type "
+                           "your own text here.")
+        self.preview_edit.setPlaceholderText(placeholder)
+        if self._active_font or self._sample in ("custom", "prose") or \
+                self._sample.startswith("code:"):
+            self._fill_preview(self._sample_text())
+        else:
+            self._fill_preview("")
+
+    def _label_sample_button(self) -> None:
+        self.sample_button.setText(
+            "Sample: " + SAMPLE_NAMES[self._sample].removeprefix("Code: "))
+
+    def _choose_sample(self, key: str) -> None:
+        self._sample = key
+        self._settings.setValue("sample", key)
+        self._label_sample_button()
+        if self._hide_unchanged:  # show the chosen sample, not the changes
+            self._toggle_unchanged()
+        else:
+            self._show_sample()
+        if key == "custom":
+            self.preview_edit.setFocus()
+
+    def _keep_custom_text(self) -> None:
+        """Remember what the user types while the custom sample is shown."""
+        if (self._sample == "custom" and not self._hide_unchanged
+                and not self._filling_preview):
+            self._custom_text = self.preview_edit.toPlainText()
+            self._auto_preview_text = self._custom_text
+            self._settings.setValue("custom_text", self._custom_text)
 
     def _show_changed_characters(self) -> None:
+        self.preview_edit.setLineWrapMode(QTextEdit.LineWrapMode.WidgetWidth)
         self.preview_edit.setPlaceholderText(
             "No characters change with the current selection.")
         text = main_characters(self._changed)
@@ -2811,7 +3252,7 @@ class MainWindow(QMainWindow):
         if self._hide_unchanged:
             self._show_changed_characters()
         else:
-            self._show_main_characters()
+            self._show_sample()
 
     # ---- processing ------------------------------------------------------ #
 
@@ -2835,11 +3276,10 @@ class MainWindow(QMainWindow):
         except OSError as exc:
             return fail(f"Cannot create the output folder:\n{exc}")
         replacenames = self.replacenames_edit.text().strip()
-        if replacenames and any(
-                pair.count("/") != 1 for pair in replacenames.split(",")):
+        if replacenames and not valid_replacenames(replacenames):
             return fail(
-                "Replace names must be written as search/replace pairs separated "
-                "by commas, for example:\n\nInter/Outer,Display/Headline")
+                "Replace names must be search/replace pairs or words to remove, "
+                "separated by commas, for example:\n\nInter/Outer,Display/Headline,OT 2")
         suffix = self.suffix_edit.text().strip()
         return {
             "output": output,

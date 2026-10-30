@@ -3,6 +3,24 @@
 All notable changes to this project are documented here.
 The format follows Keep a Changelog, and the project uses Semantic Versioning.
 
+## [0.8.0] - 2026-10-30
+### Added
+- sample text menu above the preview pane: Western character sets (the default; Western and Central European characters the font has, with ligature sequences, accented letters last), all characters in the font, prose (an English paragraph plus lines in French, German, Spanish, Portuguese, Polish, Czech and Danish/Norwegian/Swedish), code samples (JavaScript, HTML, CSS, Java, PHP, Python and Markdown), and custom text
+- custom text sample that starts empty and keeps what you type, even after quitting the app, until you change it
+- the sample chosen is remembered across launches
+- replace names can remove words from the family and style names: enter a word without a slash (e.g. 'OT 2' or 'Thin'), or with nothing after the slash; words are removed whole; a style name left empty becomes Regular, and a PostScript name left without a style is just the family (removing 'Regular' turns 'SansSerifRegular' into 'SansSerif')
+- style name of the input and output fonts in the input and output names for the selected font
+- replace names can put a hyphen into the family name ('Serif 2/Serif-2'); it is kept in the PostScript name ('SansSerif-2Caps') and not taken for the family/style separator
+- removed words are also taken out of the PostScript name where it is written without spaces ('OT 2' from 'SansSerifOT2-Thin'), hyphenated ('SansSerifOT-2-Thin'), or in the family part when it is spelled differently from the family name
+### Changed
+- the output folder defaults to the folder of the first input font file, and follows it as fonts are added or removed until an output folder is chosen
+- code samples are shown without line wrapping (scroll sideways); other samples wrap
+- the preview text size control moved to the Preview title line, leaving room for the buttons above the preview
+### Fixed
+- a PostScript name without a hyphen between family and style (e.g. 'SansSerifOT2ThinItalic') is rebuilt from the renamed family and full names ('SansSerif-ThinItalic') when replace names is used, instead of being left partly renamed
+- the output names shown before generating are now worked out by the same code that saves the fonts, so they always match the saved fonts
+- replace names now matches a search term at the end of the family name even when it is typed with a trailing space (e.g. 'OT 2 /' on 'Sans Serif OT 2'), and no longer leaves double or trailing spaces in renamed names; the output file name follows
+
 ## [0.7.0] - 2026-10-24
 ### Changed
 - width of OpenType feature listing to match the pane, with hover-over details for OpenType features that are not fully displayed

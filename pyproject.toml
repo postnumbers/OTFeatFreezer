@@ -1,6 +1,6 @@
 [project]
 name = "otfeatfreezer"
-version = "0.7.0"
+version = "0.8.0"
 description = "freezes OpenType features in fonts"
 readme = "README.md"
 authors = [
