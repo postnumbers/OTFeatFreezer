@@ -3,6 +3,16 @@
 All notable changes to this project are documented here.
 The format follows Keep a Changelog, and the project uses Semantic Versioning.
 
+## [0.9.0] - 2026-11-03
+### Added
+- 'force Family-Style PostScript and full names' checkbox in the options to control font renaming: every output font gets a PostScript name with a single hyphen, before the style ('PetalaPro' becomes 'PetalaPro-Regular', 'HermesMaia-2Caps-Regular' becomes 'HermesMaia2Caps-Regular', 'PetalaPro-Extra-Bold' becomes 'PetalaPro-ExtraBold') and a full name that is the family name plus the style name, Regular included ('Petala Pro Regular'); the output file name follows the PostScript name; PostScript names already in that form, abbreviated ones included ('HelveticaNeue-Bd'), are kept
+- the checkbox is greyed out when the PostScript and full names of all the fonts are already in the Family-Style form
+### Changed
+- a PostScript name without a hyphen is rebuilt as Family-Style, Regular included, whenever the custom suffix or replace names changes the family or style name, in the same way for both ('PetalaPro' with the suffix Frozen becomes 'PetalaProFrozen-Regular', as with replace names); when they change neither, it is left as it is unless Family-Style is forced
+- the sample text button shows short names ('Sample: Western', 'Sample: All characters', 'Sample: Custom') so it fits beside the other button; the full name is in its tooltip and menu
+### Fixed
+- the custom suffix and replace names now reach full names written differently from the family name, such as Petala Pro's Windows full name 'PetalaPro'; such a full name is rebuilt from another full name record that was renamed, or from the family and style names, and the CFF full name follows
+
 ## [0.8.0] - 2026-10-30
 ### Added
 - sample text menu above the preview pane: Western character sets (the default; Western and Central European characters the font has, with ligature sequences, accented letters last), all characters in the font, prose (an English paragraph plus lines in French, German, Spanish, Portuguese, Polish, Czech and Danish/Norwegian/Swedish), code samples (JavaScript, HTML, CSS, Java, PHP, Python and Markdown), and custom text

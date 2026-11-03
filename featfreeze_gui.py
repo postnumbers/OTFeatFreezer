@@ -105,6 +105,7 @@ LABELS = {
     "usesuffix": "custom suffix",
     "replacenames": "replace names",
     "info": "update font version string",
+    "familystyle": "force Family-Style PostScript and full names",
     "report": "report languages, scripts and features",
     "names": "names",
     "verbose": "verbose",
@@ -139,6 +140,20 @@ POPUP = {
     "info": "Update the font version string by appending '; featfreeze: "
             "<features>'. Only takes effect together with a suffix or "
             "replace names.",
+    "familystyle": "Give every output font a PostScript name of the form "
+                   "Family-Style, e.g. 'PetalaPro' becomes 'PetalaPro-Regular' "
+                   "and 'HermesMaiaThinItalic' becomes 'HermesMaia-ThinItalic' "
+                   "(the output file name follows), and a full name that is "
+                   "the family name plus the style name, Regular included: "
+                   "'Petala Pro Regular'. Unticked, a PostScript name without "
+                   "a hyphen is only rebuilt this way when the custom suffix "
+                   "or replace names changes the family or style name, and "
+                   "full names keep the font's own form. Ticked, a PostScript "
+                   "name keeps a single hyphen, before the style: hyphens "
+                   "elsewhere are taken out ('HermesMaia-2Caps-Regular' "
+                   "becomes 'HermesMaia2Caps-Regular', 'PetalaPro-Extra-Bold' "
+                   "becomes 'PetalaPro-ExtraBold'). Greyed out when all the "
+                   "fonts' names are already in this form.",
     "report": "Report the languages, scripts and features of each font in "
               "the processing output. The fonts are still saved.",
     "names": "Output the names of remapped glyphs during processing: the "
@@ -865,6 +880,7 @@ def make_options(**overrides) -> SimpleNamespace:
         inpath=None, outpath=None, features="", script=None, lang=None,
         zapnames=False, suffix=False, usesuffix="", replacenames="",
         info=False, report=False, names=False, verbose=False,
+        familystyle=False,
     )
     options.update(overrides)
     return SimpleNamespace(**options)
@@ -1021,8 +1037,7 @@ def postscript_from_names(family: str, full: str, style: str) -> str:
     return (f"{clean(family)}-{tail}" if tail else clean(family))[:63]
 
 
-def rename_styles(font: TTFont, replacenames: str,
-                  original_postscript: str | None = None) -> None:
+def rename_styles(font: TTFont, replacenames: str) -> None:
     """Apply the replace names pairs to the style names too, after
     RemapByOTL.renameFont() has renamed the family.
 
@@ -1038,12 +1053,6 @@ def rename_styles(font: TTFont, replacenames: str,
         return
     name = font["name"]
     family = name.getDebugName(16) or name.getDebugName(1) or ""
-    if original_postscript is None:
-        original_postscript = name.getDebugName(6) or ""
-    # The style as renamed, empty if the pairs removed all of it (unlike the
-    # style name records below, which fall back to Regular).
-    postscript_style = apply_pairs(
-        name.getDebugName(17) or name.getDebugName(2) or "", pairs).strip()
     changed = False
     for record in name.names:
         text = record.toStr()
@@ -1072,19 +1081,8 @@ def rename_styles(font: TTFont, replacenames: str,
             name.setName(new_style, 17, *where)
             changed = True
 
-    # A PostScript name without a hyphen ('HermesMaiaOT2ThinItalic') can't be
-    # split into family and style, so the pairs can't be applied to its style
-    # part. Rebuild it from the renamed family and full names instead. This
-    # goes by the original name: a hyphen the renaming put into the family
-    # ('HermesMaia-2Caps…') is not a family/style separator.
-    if original_postscript and "-" not in original_postscript:
-        new = postscript_from_names(
-            name.getDebugName(16) or name.getDebugName(1) or "",
-            name.getDebugName(4) or "", postscript_style)
-        for record in name.names:
-            if record.nameID == 6 and record.toStr() != new:
-                record.string = new
-                changed = True
+    # PostScript names without a hyphen are rebuilt by
+    # rebuild_hyphenless_postscript(), after any renaming.
 
     if changed and "CFF " in font:
         cff = font["CFF "].cff
@@ -1293,6 +1291,157 @@ def library_family_rename(remapper, replacenames: str) -> None:
         remapper.options = original
 
 
+def repair_full_names(font: TTFont, old_full: dict) -> None:
+    """Rebuild full names (name ID 4) that renaming could not reach.
+
+    Renaming finds the family and style inside the full name, so a full name
+    written differently is left on the old name: Petala Pro's Windows full
+    name is 'PetalaPro', without the space its family name has. A record
+    that renaming left unchanged and that doesn't start with its renamed
+    family is replaced by another full name record that was renamed (so the
+    font's own way of writing full names is kept), or else by the family and
+    style ('Petala Pro Frozen', 'Petala Pro Frozen Italic': Regular is left
+    out, as is usual). `old_full` maps (platform, encoding, language) to each
+    full name before renaming. The CFF full name is updated to match.
+    """
+    name = font["name"]
+
+    def get(name_id: int, key: tuple) -> str:
+        record = name.getName(name_id, *key)
+        return record.toStr() if record is not None else ""
+
+    records = [r for r in name.names if r.nameID == 4]
+    stale = []
+    for record in records:
+        key = (record.platformID, record.platEncID, record.langID)
+        family = get(16, key) or get(1, key)
+        text = record.toStr()
+        if family and text == old_full.get(key) and not text.startswith(family):
+            stale.append((record, key, family))
+    for record, key, family in stale:
+        style = get(17, key) or get(2, key)
+        renamed = [r.toStr() for r in records
+                   if r not in [s[0] for s in stale]
+                   and r.toStr().startswith(family)]
+        if renamed:
+            record.string = renamed[0]
+        else:
+            record.string = (family if style in ("", "Regular")
+                             else f"{family} {style}")
+    if stale and "CFF " in font:
+        full = name.getName(4, 3, 1) or name.getName(4, 1, 0)
+        if full is not None:
+            font["CFF "].cff[0].rawDict["FullName"] = full.toStr()
+
+
+def rebuild_hyphenless_postscript(font: TTFont, original_postscript: str,
+                                  original_style: str, replacenames: str) -> None:
+    """Rebuild a PostScript name that had no hyphen, after renaming.
+
+    A name like 'HermesMaiaOT2ThinItalic' can't be split into family and
+    style, so neither the suffix nor the pairs can be applied to its parts.
+    It is rebuilt from the renamed family and full names as 'Family-Style'
+    ('HermesMaia-ThinItalic'), the same way whether a suffix, replace names
+    or both were used. Regular is written out too, even if the original name
+    left it out: 'PetalaPro' with the suffix Frozen becomes
+    'PetalaProFrozen-Regular'. A style removed entirely by the pairs leaves
+    just the family. This goes by the original name: a hyphen
+    the renaming put into the family ('HermesMaia-2Caps…') is not a
+    family/style separator. The CFF font name is updated to match.
+    """
+    if not original_postscript or "-" in original_postscript:
+        return
+    name = font["name"]
+    # The style as renamed, empty if the pairs removed all of it (unlike the
+    # style name records, which fall back to Regular).
+    style = apply_pairs(original_style, parse_pairs(replacenames)).strip()
+    new = postscript_from_names(
+        name.getDebugName(16) or name.getDebugName(1) or "",
+        name.getDebugName(4) or "", style)
+    changed = False
+    for record in name.names:
+        if record.nameID == 6 and record.toStr() != new:
+            record.string = new
+            changed = True
+    if changed and "CFF " in font:
+        font["CFF "].cff.fontNames[0] = new
+
+
+def family_style_full_names(font: TTFont) -> None:
+    """Make every full name (name ID 4) the family name plus the style name
+    of the same platform and language, Regular included ('Petala Pro
+    Regular'), preferring the typographic family and style (IDs 16, 17). The
+    CFF full name is updated to match."""
+    name = font["name"]
+
+    def get(name_id: int, key: tuple) -> str:
+        record = name.getName(name_id, *key)
+        return record.toStr().strip() if record is not None else ""
+
+    for record in [r for r in name.names if r.nameID == 4]:
+        key = (record.platformID, record.platEncID, record.langID)
+        family = get(16, key) or get(1, key)
+        style = get(17, key) or get(2, key)
+        if family:
+            new = f"{family} {style}" if style else family
+            if record.toStr() != new:
+                record.string = new
+    if "CFF " in font:
+        full = name.getName(4, 3, 1) or name.getName(4, 1, 0)
+        if full is not None:
+            font["CFF "].cff[0].rawDict["FullName"] = full.toStr()
+
+
+def compact_postscript(text: str) -> str:
+    """`text` as a PostScript name part: no spaces, no hyphens, and none of
+    the characters PostScript names can't hold."""
+    return re.sub(r"[^!-~]|[\[\](){}<>/%-]", "", text)
+
+
+def postscript_is_family_style(postscript: str, family: str, style: str) -> bool:
+    """Whether a PostScript name has exactly one hyphen, and that hyphen
+    comes before the style: the part before it is the family ('PetalaPro-Bd'
+    counts) or the part after it is the style."""
+    if postscript.count("-") != 1:
+        return False
+    head, tail = postscript.split("-")
+    return head == compact_postscript(family) or (
+        bool(style) and tail == compact_postscript(style))
+
+
+def family_style_postscript(font: TTFont) -> None:
+    """Give the font a PostScript name with a single hyphen, before the
+    style ('HermesMaia-2Caps-Regular' -> 'HermesMaia2Caps-Regular',
+    'PetalaPro-Extra-Bold' -> 'PetalaPro-ExtraBold'), built from the
+    typographic family and style. Names already in that form, such as an
+    abbreviated 'HelveticaNeue-Bd', are kept. The CFF font name follows."""
+    names = font_names(font)
+    if postscript_is_family_style(names["postscript"], names["family"],
+                                  names["style"]):
+        return
+    family = compact_postscript(names["family"])
+    style = compact_postscript(names["style"])
+    new = (f"{family}-{style}" if style else family)[:63]
+    if not family:
+        return
+    name = font["name"]
+    for record in name.names:
+        if record.nameID == 6 and record.toStr() != new:
+            record.string = new
+    if "CFF " in font:
+        font["CFF "].cff.fontNames[0] = new
+
+
+def is_family_style(font: TTFont) -> bool:
+    """Whether the font's PostScript name already has a single hyphen before
+    the style and its full name is the family name plus the style name."""
+    names = font_names(font)
+    full = f"{names['family']} {names['style']}".strip()
+    return (postscript_is_family_style(names["postscript"], names["family"],
+                                       names["style"])
+            and names["full"] == full)
+
+
 def rename_font(remapper, options: SimpleNamespace) -> str:
     """Rename the font in `remapper.ttx` as the suffix and replace names
     options say, and return its output file name. Used both when saving and
@@ -1300,9 +1449,26 @@ def rename_font(remapper, options: SimpleNamespace) -> str:
     names = remapper.ttx["name"]
     old_family = names.getDebugName(16) or names.getDebugName(1) or ""
     old_postscript = names.getDebugName(6) or ""
+    before = font_names(remapper.ttx)
+    old_full = {(r.platformID, r.platEncID, r.langID): r.toStr()
+                for r in names.names if r.nameID == 4}
     library_family_rename(remapper, options.replacenames)
-    rename_styles(remapper.ttx, options.replacenames, old_postscript)
+    rename_styles(remapper.ttx, options.replacenames)
     renamed = bool(options.suffix or options.replacenames)
+    after = font_names(remapper.ttx)
+    changed = (after["family"], after["style"]) != (before["family"], before["style"])
+    if changed:
+        repair_full_names(remapper.ttx, old_full)
+    # A PostScript name without a hyphen is rebuilt as Family-Style when the
+    # names changed, or for every font when that is forced.
+    if changed or getattr(options, "familystyle", False):
+        rebuild_hyphenless_postscript(remapper.ttx, old_postscript,
+                                      before["style"], options.replacenames)
+    if getattr(options, "familystyle", False):
+        family_style_full_names(remapper.ttx)
+        family_style_postscript(remapper.ttx)
+    # A forced Family-Style name renames the font too (ID 3, file name).
+    renamed = renamed or (names.getDebugName(6) or "") != old_postscript
     if renamed:
         # The library leaves the unique ID (name ID 3) on the old names;
         # bring it in line with the new family and PostScript names.
@@ -1370,7 +1536,8 @@ def freeze_font(options: SimpleNamespace, folder: str, taken: set[str],
     return target
 
 
-def predict_names(path: str, suffix: str, replacenames: str) -> dict:
+def predict_names(path: str, suffix: str, replacenames: str,
+                  familystyle: bool = False) -> dict:
     """The names a font will get, without freezing anything.
 
     Runs the same renaming as saving does (rename_font) on the font in
@@ -1379,13 +1546,14 @@ def predict_names(path: str, suffix: str, replacenames: str) -> dict:
     """
     font = TTFont(path, lazy=True)
     try:
-        if not suffix and not replacenames:
+        if not suffix and not replacenames and not familystyle:
             return {"filename": os.path.basename(path), **font_names(font)}
         name = font["name"]
         if name.getName(16, 3, 1) is None and name.getName(1, 3, 1) is None:
             raise ValueError("no Windows family name to rename")
         options = make_options(inpath=path, suffix=bool(suffix),
-                               usesuffix=suffix, replacenames=replacenames)
+                               usesuffix=suffix, replacenames=replacenames,
+                               familystyle=familystyle)
         remapper = RemapByOTL(options)
         remapper.ttx = font
         filename = rename_font(remapper, options)
@@ -1508,7 +1676,7 @@ class FreezeWorker(QThread):
                             key: settings[key] for key in (
                                 "features", "script", "lang", "zapnames",
                                 "suffix", "usesuffix", "replacenames",
-                                "info", "names", "verbose")})
+                                "familystyle", "info", "names", "verbose")})
                         outpath = freeze_font(options, self._folder, taken,
                                               settings["choices"], self._overwrite)
                     except Exception as exc:  # keep going with the other fonts
@@ -2052,6 +2220,7 @@ class MainWindow(QMainWindow):
         # because they were already frozen) leave untouched glyphs as they are.
         self._choices: dict = {"off": {}, "on": {}, "keep": set()}
         self._frozen_cache: dict[str, set[str]] = {}  # path -> frozen features
+        self._familystyle_cache: dict[str, bool] = {}  # path -> names in that form
         self._previewing_tag: str | None = None   # feature whose dialog is open
         self._last_font_folder = ""                # where "Add fonts…" last looked
         self._status_text = ("", "")               # preview status: before / after count
@@ -2151,7 +2320,8 @@ class MainWindow(QMainWindow):
         self._names_timer.timeout.connect(self._update_output_names)
         for signal in (self.suffix_edit.textChanged,
                        self.replacenames_edit.textChanged,
-                       self.output_edit.textChanged):
+                       self.output_edit.textChanged,
+                       self.familystyle_check.toggled):
             signal.connect(self._names_timer.start)
 
         self._set_theme(self._theme)
@@ -2327,6 +2497,7 @@ class MainWindow(QMainWindow):
         self.replacenames_edit.setPlaceholderText("search/replace, or a word to remove")
         add_field(LABELS["replacenames"], self.replacenames_edit, "replacenames")
         self.info_check = add_check("info")
+        self.familystyle_check = add_check("familystyle")
 
         add_heading(GROUP_FREEZING)
         self.script_combo = QComboBox()
@@ -2361,7 +2532,6 @@ class MainWindow(QMainWindow):
             "the characters the selected features change.")
         self.unchanged_button.clicked.connect(self._toggle_unchanged)
         self.sample_button = QPushButton()
-        self.sample_button.setToolTip("Choose the sample text shown in the preview")
         menu = QMenu(self.sample_button)
         code_menu = None
         for key, label in SAMPLE_NAMES.items():
@@ -2700,13 +2870,14 @@ class MainWindow(QMainWindow):
     def _update_file_count(self, *_args) -> None:
         self.files_title.setText(f"Font files to process ({self.font_list.count()})")
 
-    def _rename_settings(self) -> tuple[str, str] | None:
-        """(custom suffix, replace names) as used for renaming, or None if
-        replace names is not valid."""
+    def _rename_settings(self) -> tuple[str, str, bool] | None:
+        """(custom suffix, replace names, force Family-Style) as used for
+        renaming, or None if replace names is not valid."""
         replacenames = self.replacenames_edit.text().strip()
         if replacenames and not valid_replacenames(replacenames):
             return None
-        return self.suffix_edit.text().strip(), replacenames
+        return (self.suffix_edit.text().strip(), replacenames,
+                self.familystyle_check.isChecked())
 
     def _planned_outputs(self, overwrite: bool) -> list[tuple[str, str | None]]:
         """(input path, output file name) for every font, as Generate would
@@ -2764,9 +2935,32 @@ class MainWindow(QMainWindow):
             else QMessageBox.StandardButton.Ok)
         return choice if answer == QMessageBox.StandardButton.Ok else None
 
+    def _is_family_style(self, path: str) -> bool:
+        if path not in self._familystyle_cache:
+            try:
+                font = TTFont(path, lazy=True)
+                try:
+                    self._familystyle_cache[path] = is_family_style(font)
+                finally:
+                    font.close()
+            except Exception:
+                self._familystyle_cache[path] = True  # nothing to offer
+        return self._familystyle_cache[path]
+
+    def _update_familystyle_check(self) -> None:
+        """Grey out "force Family-Style" when every font's PostScript and full
+        names are already in that form, so it would change nothing."""
+        paths = self.font_paths()
+        useful = not paths or not all(self._is_family_style(p) for p in paths)
+        self.familystyle_check.setEnabled(useful)
+        self.familystyle_check.setToolTip(
+            "" if useful else "The PostScript and full names of all the fonts "
+            "are already in the Family-Style form.")
+
     def _update_output_names(self) -> None:
         """Fill in each font's output file name and the selected font's
         PostScript name, exactly as Generate will name them."""
+        self._update_familystyle_check()
         settings = self._rename_settings()
         folder = self.output_edit.text().strip()
         folder = os.path.abspath(os.path.expanduser(folder)) if folder else ""
@@ -3214,8 +3408,13 @@ class MainWindow(QMainWindow):
             self._fill_preview("")
 
     def _label_sample_button(self) -> None:
+        # Short names on the button, so it fits beside the other one.
+        short = {"western": "Western", "all": "All characters",
+                 "custom": "Custom"}.get(self._sample)
         self.sample_button.setText(
-            "Sample: " + SAMPLE_NAMES[self._sample].removeprefix("Code: "))
+            "Sample: " + (short or SAMPLE_NAMES[self._sample].removeprefix("Code: ")))
+        self.sample_button.setToolTip(
+            f"Sample text: {SAMPLE_NAMES[self._sample]}. Click to choose another.")
 
     def _choose_sample(self, key: str) -> None:
         self._sample = key
@@ -3292,6 +3491,7 @@ class MainWindow(QMainWindow):
             "usesuffix": suffix,
             "replacenames": replacenames,
             "info": self.info_check.isChecked(),
+            "familystyle": self.familystyle_check.isChecked(),
             "report": self.report_check.isChecked(),
             "names": self.names_check.isChecked(),
             "verbose": self.verbose_check.isChecked(),
